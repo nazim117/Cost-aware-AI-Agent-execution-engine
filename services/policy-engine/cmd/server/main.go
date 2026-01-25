@@ -1,59 +1,12 @@
 package main
 
 import (
-	"encoding/json"
+	"engine/internal/handlers"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
-
-type PolicyDecisionResponse struct {
-	Decision struct {
-		Allowed           bool   `json:"allowed"`
-		SelectedModelTier string `json:"selected_model_tier"`
-		HardStop          bool   `json:"hard_stop"`
-	} `json:"decision"`
-	Reason        string `json:"reason"`
-	PolicyVersion string `json:"policy_version"`
-}
-
-func evaluatePolicyHandler(w http.ResponseWriter, r *http.Request) {
-	// Always enforce method
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Always respect request cancellation
-	ctx := r.Context()
-	select {
-	case <-ctx.Done():
-		http.Error(w, "request cancelled", http.StatusRequestTimeout)
-		return
-	default:
-	}
-
-	// We don't parse the body yet — this is intentional.
-	// For now, we just acknowledge the request exists.
-	log.Println("Received policy evaluation request")
-
-	response := PolicyDecisionResponse{
-		Reason:        "default_allow",
-		PolicyVersion: "v1.0",
-	}
-
-	response.Decision.Allowed = true
-	response.Decision.SelectedModelTier = "efficient"
-	response.Decision.HardStop = false
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("failed to encode response: %v", err)
-	}
-}
 
 func main() {
 	port := os.Getenv("PORT")
@@ -62,7 +15,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/policy/evaluate", evaluatePolicyHandler)
+	mux.HandleFunc("/policy/evaluate", handlers.EvaluatePolicyHandler)
 
 	server := &http.Server{
 		Addr:         ":" + port,
