@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 
@@ -25,6 +26,7 @@ func RunAgentHandler(w http.ResponseWriter, r *http.Request) {
 	policyURL := os.Getenv("POLICY_ENGINE_URL")
 	if policyURL == "" {
 		policyURL = "http://localhost:8080"
+		log.Printf("%s", "POLICY_ENGINE_URL not set, rolling back to default: "+policyURL)
 	}
 
 	client := policyclient.New(policyURL)

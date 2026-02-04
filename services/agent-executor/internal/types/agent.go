@@ -1,9 +1,10 @@
 package types
 
 type AgentRunRequest struct {
-	Goal     string  `json:"goal"`
-	Budget   float64 `json:"budget"`
-	Priority string  `json:"priority"`
+	Goal         string  `json:"goal"`
+	Budget       float64 `json:"budget"`
+	Priority     string  `json:"priority"`
+	LatencySLAMs int     `json:"latency_sla_ms"`
 }
 
 type AgentRunResponse struct {

@@ -30,20 +30,26 @@ func EvaluatePolicyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	policyCtx := policy.BudgetContext{
-		Budget: struct {
-			Total     float64
-			Remaining float64
-		}{
-			Total:     ctx.Budget.Total,
-			Remaining: ctx.Budget.Remaining,
-		},
+	policyCtx := policy.PolicyContext{
+		StepName: ctx.Step.Name,
 	}
+
+	policyCtx.Budget.Total = ctx.Budget.Total
+	policyCtx.Budget.Remaining = ctx.Budget.Remaining
+
+	policyCtx.Request.LatencySLAMs = ctx.Request.LatencySLAMs
 
 	decision := policy.Evaluate(policyCtx)
 
 	log.Println("Received policy evaluation request")
-	
+	log.Printf(
+		"[POLICY] step=%s budget=%.2f/%.2f sla=%dms",
+		ctx.Step.Name,
+		ctx.Budget.Remaining,
+		ctx.Budget.Total,
+		ctx.Request.LatencySLAMs,
+	)
+
 	response := PolicyDecisionResponse{
 		Decision: struct {
 			Allowed           bool   `json:"allowed"`

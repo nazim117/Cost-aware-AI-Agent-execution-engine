@@ -30,6 +30,10 @@ type PolicyRequest struct {
 		Total     float64 `json:"total"`
 		Remaining float64 `json:"remaining"`
 	} `json:"budget"`
+
+	Request struct {
+		LatencySLAMs int `json:"latency_sla_ms"`
+	} `json:"request"`
 }
 
 type PolicyResponse struct {
