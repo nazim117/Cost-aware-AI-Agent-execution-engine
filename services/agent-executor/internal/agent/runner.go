@@ -43,6 +43,7 @@ func RunAgent(
 		policyReq.Step.Name = step
 		policyReq.Budget.Total = req.Budget
 		policyReq.Budget.Remaining = remainingBudget
+		policyReq.Request.LatencySLAMs = req.LatencySLAMs
 
 		decision, err := policy.Evaluate(policyReq)
 		if err != nil {
