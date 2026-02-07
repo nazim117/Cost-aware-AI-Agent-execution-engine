@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"agent-executor/internal/handlers"
+	"agent-executor/internal/metrics"
 )
 
 func main() {
@@ -16,7 +17,10 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/agent/run", handlers.RunAgentHandler)
+	m := metrics.New()
+
+	mux.HandleFunc("/agent/run", handlers.RunAgentHandler(m))
+	mux.HandleFunc("/metrics", handlers.MetricsHandler(m))
 
 	server := &http.Server{
 		Addr:         ":" + port,
