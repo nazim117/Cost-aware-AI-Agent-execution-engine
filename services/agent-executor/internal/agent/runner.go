@@ -2,17 +2,13 @@ package agent
 
 import (
 	"errors"
+	"strings"
 	"time"
 
+	"agent-executor/internal/metrics"
 	"agent-executor/internal/policyclient"
 	"agent-executor/internal/types"
 )
-
-var latencyByTier = map[string]time.Duration{
-	"cheap":    80 * time.Millisecond,
-	"standard": 200 * time.Millisecond,
-	"premium":  450 * time.Millisecond,
-}
 
 var steps = []string{
 	"plan",
@@ -26,11 +22,32 @@ var costByTier = map[string]float64{
 	"premium":  0.030,
 }
 
+var latencyByTier = map[string]time.Duration{
+	"cheap":    80 * time.Millisecond,
+	"standard": 200 * time.Millisecond,
+	"premium":  450 * time.Millisecond,
+}
+
+func baselineTierForStep(step string) string {
+	switch step {
+	case "plan":
+		return "premium"
+	case "execute":
+		return "standard"
+	case "summarize":
+		return "cheap"
+	default:
+		return "standard"
+	}
+}
+
 func RunAgent(
 	req types.AgentRunRequest,
 	policy *policyclient.Client,
+	metrics *metrics.Metrics,
 ) (*types.AgentRunResponse, error) {
 
+	metrics.IncAgentRun()
 	start := time.Now()
 
 	remainingBudget := req.Budget
@@ -51,10 +68,23 @@ func RunAgent(
 		}
 
 		if decision.Decision.HardStop {
+			metrics.IncHardStop()
 			break
 		}
 
+		baseline := baselineTierForStep(step)
 		tier := decision.Decision.SelectedModelTier
+
+		// Metrics: downgrade detection
+		if tier != baseline {
+			metrics.IncDowngrade(decision.Reason)
+		}
+
+		// Metrics: SLA protection
+		if strings.Contains(decision.Reason, "sla") {
+			metrics.IncSLAPrevented()
+		}
+
 		latency := latencyByTier[tier]
 		time.Sleep(latency)
 
@@ -65,6 +95,15 @@ func RunAgent(
 
 		remainingBudget -= cost
 		totalCost += cost
+
+		metrics.AddCost(cost)
+		metrics.IncStep(step, tier)
+
+		// Cost saved vs baseline
+		baselineCost := costByTier[baseline]
+		if baselineCost > cost {
+			metrics.AddCostSaved(baselineCost - cost)
+		}
 
 		trace = append(trace, types.AgentStepRun{
 			Step:      step,
