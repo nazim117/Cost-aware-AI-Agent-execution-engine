@@ -98,6 +98,7 @@ go run ./cmd/server
 **Response:**
 
 ```json
+{
   "result": "simulated agent result",
   "total_cost": 0.045,
   "total_latency_ms": 720,
@@ -136,6 +137,7 @@ Each step includes: selected model tier, simulated cost and latency, and decisio
 **Example response:**
 
 ```json
+{
   "AgentRunsTotal": 3,
   "AgentStepsTotal": {
     "plan": { "standard": 2, "premium": 1 },
@@ -150,17 +152,14 @@ Each step includes: selected model tier, simulated cost and latency, and decisio
   "AgentCostSaved": 0.06,
   "SLAViolationsPrevented": 1
 }
+```
 
 
 These metrics allow you to quantify:
-
-cost savings
-
-policy impact
-
-SLA protection
-
-downgrade frequency
+- Cost savings
+- Policy impact
+- SLA protection
+- Downgrade frequency
 
 ## Integration Guide
 
@@ -225,26 +224,22 @@ Your system keeps:
 
 ```
 services/
-├── agent-executor/        # Executes agent runs, enforces decisions, exposes metrics
-└── policy-engine/         # Evaluates policies based on budget, step, and latency
+├── agent-executor/ 
+└── policy-engine/
 ```
 
 ## When Should You Use This?
 
 This system is useful when you:
 
-- 🎯 run agents in production
-- 💰 care about predictable costs
-- ⏱️ need latency guarantees
-- 🔍 want explainable decisions
-- 🎮 want infra-level control over AI usage
+- Run agents in production
+- Care about predictable costs
+- Need latency guarantees
+- Want explainable decisions
+- Want infra-level control over AI usage
 
 ## Contributing
 
-- 📝 Open issues or pull requests
-- 🧩 Keep services small and composable
-- 🎯 Prefer explicit logic over implicit behavior
-
----
-
-**License:** See [LICENSE](LICENSE) for details.
+- Open issues or pull requests
+- Keep services small and composable
+- Prefer explicit logic over implicit behavior
