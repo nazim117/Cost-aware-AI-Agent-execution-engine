@@ -1,11 +1,13 @@
 package main
 
 import (
-	"agent-executor/internal/handlers"
 	"log"
 	"net/http"
 	"os"
 	"time"
+
+	"agent-executor/internal/handlers"
+	"agent-executor/internal/metrics"
 )
 
 func main() {
@@ -15,7 +17,10 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/agent/run", handlers.RunAgentHandler)
+	m := metrics.New()
+
+	mux.HandleFunc("/agent/run", handlers.RunAgentHandler(m))
+	mux.HandleFunc("/metrics", handlers.MetricsHandler(m))
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -25,5 +30,7 @@ func main() {
 	}
 
 	log.Printf("Agent Executor listening on :%s", port)
-	log.Fatal(server.ListenAndServe())
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("server failed: %v", err)
+	}
 }

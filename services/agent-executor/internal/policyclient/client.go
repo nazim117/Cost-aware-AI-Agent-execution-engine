@@ -22,14 +22,18 @@ func New(baseURL string) *Client {
 }
 
 type PolicyRequest struct {
+	Step struct {
+		Name string `json:"name"`
+	} `json:"step"`
+
 	Budget struct {
 		Total     float64 `json:"total"`
 		Remaining float64 `json:"remaining"`
 	} `json:"budget"`
 
-	Step struct {
-		Name string `json:"name"`
-	} `json:"step"`
+	Request struct {
+		LatencySLAMs int `json:"latency_sla_ms"`
+	} `json:"request"`
 }
 
 type PolicyResponse struct {
@@ -42,7 +46,10 @@ type PolicyResponse struct {
 }
 
 func (c *Client) Evaluate(req PolicyRequest) (*PolicyResponse, error) {
-	body, _ := json.Marshal(req)
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
 
 	httpReq, err := http.NewRequest(
 		http.MethodPost,
