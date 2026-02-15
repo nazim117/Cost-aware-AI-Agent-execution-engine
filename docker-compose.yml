@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  policy-engine:
+    build:
+      context: ./services/policy-engine
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+    restart: unless-stopped
+
+  agent-executor:
+    build:
+      context: ./services/agent-executor
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - PORT=8081
+    depends_on:
+      - policy-engine
+    restart: unless-stopped
+
+networks:
+  default:
+    name: cost-aware-ai-net
