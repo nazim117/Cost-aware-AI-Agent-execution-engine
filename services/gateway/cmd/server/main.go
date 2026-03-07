@@ -8,8 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"time"
+
+	"gateway/internal/logger"
+	"gateway/internal/scanner"
 )
 
 // OpenAI API types
@@ -46,69 +48,8 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// PII Scanner
-type PIIScanner struct {
-	patterns map[string]*regexp.Regexp
-}
-
-func NewPIIScanner() *PIIScanner {
-	return &PIIScanner{
-		patterns: map[string]*regexp.Regexp{
-			"ssn":         regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`),
-			"email":       regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b`),
-			"credit_card": regexp.MustCompile(`\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b`),
-			"phone":       regexp.MustCompile(`\b\d{3}[-.]?\d{3}[-.]?\d{4}\b`),
-		},
-	}
-}
-
-type ScanResult struct {
-	HasPII       bool     `json:"has_pii"`
-	PIITypes     []string `json:"pii_types"`
-	RedactedText string   `json:"redacted_text"`
-}
-
-func (s *PIIScanner) Scan(text string) ScanResult {
-	result := ScanResult{
-		RedactedText: text,
-		PIITypes:     []string{},
-	}
-
-	for piiType, pattern := range s.patterns {
-		if pattern.MatchString(text) {
-			result.HasPII = true
-			result.PIITypes = append(result.PIITypes, piiType)
-			result.RedactedText = pattern.ReplaceAllString(
-				result.RedactedText,
-				"[REDACTED]",
-			)
-		}
-	}
-
-	return result
-}
-
-// Audit Logger
-type AuditLog struct {
-	Timestamp   time.Time `json:"timestamp"`
-	UserID      string    `json:"user_id"`
-	Model       string    `json:"model"`
-	Prompt      string    `json:"prompt"`
-	Response    string    `json:"response"`
-	PIIDetected []string  `json:"pii_detected"`
-	Blocked     bool      `json:"blocked"`
-}
-
-func logRequest(log AuditLog) {
-	// For MVP: just log to stdout
-	// In production: write to database or log aggregator
-	logJSON, _ := json.Marshal(log)
-	fmt.Printf("AUDIT: %s\n", string(logJSON))
-}
-
 // Gateway Server
 type Gateway struct {
-	scanner    *PIIScanner
 	openAIKey  string
 	openAIURL  string
 	blockOnPII bool
@@ -120,11 +61,16 @@ func NewGateway() *Gateway {
 		log.Fatal("DEEPSEEK_API_KEY environment variable required")
 	}
 
+	// BLOCK_ON_PII=true: reject requests containing PII with HTTP 403.
+	// Default is false: redact PII inline and forward the cleaned request.
+	// Use block mode at user-facing API boundaries; use redact mode (default)
+	// inside agent pipelines so PII in goals doesn't abort the entire run.
+	blockOnPII := os.Getenv("BLOCK_ON_PII") == "true"
+
 	return &Gateway{
-		scanner:    NewPIIScanner(),
-		openAIKey:  apiKey,                                         // Still called openAIKey but holds DeepSeek key
-		openAIURL:  "https://api.deepseek.com/v1/chat/completions", // <-- Changed!
-		blockOnPII: true,
+		openAIKey:  apiKey,
+		openAIURL:  "https://api.deepseek.com/v1/chat/completions",
+		blockOnPII: blockOnPII,
 	}
 }
 
@@ -136,20 +82,18 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Scan all messages for PII
+	// 2. Scan all messages for PII using the canonical scanner package.
 	var allPII []string
 	for i, msg := range req.Messages {
-		scanResult := g.scanner.Scan(msg.Content)
+		scanResult := scanner.ScanForPII(msg.Content)
 
 		if scanResult.HasPII {
 			allPII = append(allPII, scanResult.PIITypes...)
 
 			if g.blockOnPII {
-				// Block the request
 				log.Printf("PII detected, blocking request: %v", scanResult.PIITypes)
 
-				// Log the blocked request
-				logRequest(AuditLog{
+				logger.LogRequest(logger.AuditLog{
 					Timestamp:   time.Now(),
 					Model:       req.Model,
 					Prompt:      msg.Content,
@@ -157,33 +101,32 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 					Blocked:     true,
 				})
 
-				// Return error to client
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"error": map[string]interface{}{
-						"message": fmt.Sprintf("PII detected: %v. Request blocked.", scanResult.PIITypes),
-						"type":    "pii_violation",
-						"code":    "pii_detected",
+						"message":   fmt.Sprintf("PII detected: %v. Request blocked.", scanResult.PIITypes),
+						"type":      "pii_violation",
+						"code":      "pii_detected",
+						"pii_types": scanResult.PIITypes,
 					},
 				})
 				return
-			} else {
-				// Redact PII and continue
-				req.Messages[i].Content = scanResult.RedactedText
 			}
+			// Redact PII and continue
+			req.Messages[i].Content = scanResult.RedactedText
 		}
 	}
 
-	// 3. Forward to OpenAI
+	// 3. Forward to upstream LLM
 	resp, err := g.forwardToOpenAI(req)
 	if err != nil {
-		log.Printf("Error forwarding to OpenAI: %v", err)
-		http.Error(w, "Error contacting OpenAI", http.StatusInternalServerError)
+		log.Printf("Error forwarding to LLM: %v", err)
+		http.Error(w, "Error contacting upstream LLM", http.StatusInternalServerError)
 		return
 	}
 
-	// 4. Log the request (successful)
+	// 4. Emit audit log entry for the completed (non-blocked) request.
 	promptText := ""
 	if len(req.Messages) > 0 {
 		promptText = req.Messages[len(req.Messages)-1].Content
@@ -193,7 +136,7 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		responseText = resp.Choices[0].Message.Content
 	}
 
-	logRequest(AuditLog{
+	logger.LogRequest(logger.AuditLog{
 		Timestamp:   time.Now(),
 		Model:       req.Model,
 		Prompt:      promptText,
