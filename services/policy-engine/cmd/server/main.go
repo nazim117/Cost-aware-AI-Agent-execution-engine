@@ -1,12 +1,20 @@
 package main
 
 import (
+	"encoding/json"
 	"engine/internal/handlers"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "healthy",
+	})
+}
 
 func main() {
 	port := os.Getenv("PORT")
@@ -16,6 +24,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/policy/evaluate", handlers.EvaluatePolicyHandler)
+	mux.HandleFunc("/health", handleHealth)
 
 	server := &http.Server{
 		Addr:         ":" + port,

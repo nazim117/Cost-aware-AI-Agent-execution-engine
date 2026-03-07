@@ -25,8 +25,15 @@ go.work
 go.work.sum
 
 # env file
-.env
+services/gateway/.env
+
+# Audit logs produced by the gateway at runtime
+*.jsonl
+
+# Windows NUL device artifact
+nul
 
 # Editor/IDE
 # .idea/
 # .vscode/
+.gitnexus
