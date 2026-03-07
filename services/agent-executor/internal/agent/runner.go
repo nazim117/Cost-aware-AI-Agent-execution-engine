@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"agent-executor/internal/gatewayclient"
+	"agent-executor/internal/llmclient"
 	"agent-executor/internal/metrics"
 	"agent-executor/internal/policyclient"
 	"agent-executor/internal/types"
@@ -20,6 +22,12 @@ var latencyByTier = map[string]time.Duration{
 	"cheap":    80 * time.Millisecond,
 	"standard": 200 * time.Millisecond,
 	"premium":  450 * time.Millisecond,
+}
+
+var modelByTier = map[string]string{
+	"cheap":    "deepseek-chat",
+	"standard": "deepseek-chat",
+	"premium":  "deepseek-coder",
 }
 
 // baselineTierForStep returns the "ideal" tier for a given step type,
@@ -130,7 +138,18 @@ func RunAgent(
 		}
 
 		latency := latencyByTier[tier]
-		time.Sleep(latency)
+		startTime := time.Now()
+
+		_, err = callLLMWithPIIScanning(req.Goal, stepType, tier, node.Name)
+		actualLatency := time.Since(startTime)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if actualLatency < latency {
+			time.Sleep(latency - actualLatency)
+		}
 
 		cost := costByTier[tier]
 
@@ -162,4 +181,103 @@ func RunAgent(
 		TotalLatencyMs: totalLatency.Milliseconds(),
 		Steps:          trace,
 	}, nil
+}
+
+// callLLMWithPIIScanning is the single choke-point through which every LLM
+// call in the agent-executor must pass.  It enforces PII hygiene before any
+// text reaches the model:
+//
+//  1. Gateway path (preferred, when GATEWAY_URL is set):
+//     The full chat request is sent to the gateway service, which performs its
+//     own PII scan, blocks or redacts as configured, emits an audit log entry,
+//     and forwards the cleaned request to the upstream LLM.  The agent-executor
+//     never touches the LLM directly in this path.
+//
+//  2. Local fallback (when GATEWAY_URL is not set):
+//     The llmclient's built-in PIIScanner runs first.  The redacted text (not
+//     the original goal) is used in the chat request.  blockOnPII=true means
+//     any PII in the goal causes an immediate error rather than a silent pass.
+func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, error) {
+	// Ensure clients are initialised.  Both are no-ops after the first call.
+	gatewayclient.InitDefault()
+	if llmclient.DefaultClient == nil {
+		llmclient.InitDefault()
+	}
+
+	systemPrompt := getSystemPromptForStep(stepType)
+	model := modelByTier[tier]
+
+	// --- Gateway path ---
+	// When a gateway is available, hand off the entire request.  The gateway
+	// is the authoritative PII enforcement point; we do not run a second local
+	// scan on top of it.
+	if gatewayclient.Available() {
+		req := gatewayclient.ChatRequest{
+			Model: model,
+			Messages: []gatewayclient.Message{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: goal},
+			},
+			Temperature: 0.7,
+			MaxTokens:   1024,
+		}
+		resp, err := gatewayclient.DefaultClient.Chat(req)
+		if err != nil {
+			return "", err
+		}
+		if len(resp.Choices) > 0 {
+			return resp.Choices[0].Message.Content, nil
+		}
+		return "", nil
+	}
+
+	// --- Local fallback path ---
+	// Run the local PII scanner.  Use the *redacted* text in the request so
+	// that raw PII is never forwarded to the LLM even if blockOnPII is false.
+	redactedGoal, piiTypes, err := llmclient.DefaultClient.ScanPrompt(goal)
+	if err != nil {
+		// ScanPrompt returns an error only when PII is found and blockOnPII=true.
+		return "", err
+	}
+
+	userContent := redactedGoal
+	if len(piiTypes) > 0 {
+		// Prefix lets downstream consumers know redaction occurred without
+		// leaking what was redacted.
+		userContent = "[PII REDACTED] " + redactedGoal
+	}
+
+	req := llmclient.ChatRequest{
+		Model: model,
+		Messages: []llmclient.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userContent},
+		},
+		Temperature: 0.7,
+		MaxTokens:   1024,
+	}
+
+	resp, err := llmclient.DefaultClient.Chat(req)
+	if err != nil {
+		return "", err
+	}
+
+	if len(resp.Choices) > 0 {
+		return resp.Choices[0].Message.Content, nil
+	}
+
+	return "", nil
+}
+
+func getSystemPromptForStep(stepType string) string {
+	switch stepType {
+	case "plan":
+		return "You are a planning agent. Analyze the user's request and create a detailed plan with steps."
+	case "execute":
+		return "You are an execution agent. Carry out the given plan and provide results."
+	case "summarize":
+		return "You are a summarization agent. Summarize the results concisely."
+	default:
+		return "You are a helpful assistant."
+	}
 }

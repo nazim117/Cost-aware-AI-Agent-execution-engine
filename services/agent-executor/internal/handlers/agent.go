@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 
 	"agent-executor/internal/agent"
+	"agent-executor/internal/gatewayclient"
 	"agent-executor/internal/metrics"
 	"agent-executor/internal/policyclient"
 	"agent-executor/internal/types"
@@ -35,6 +37,19 @@ func RunAgentHandler(m *metrics.Metrics) http.HandlerFunc {
 
 		result, err := agent.RunAgent(req, client, m)
 		if err != nil {
+			var piiErr *gatewayclient.PIIBlockedError
+			if errors.As(err, &piiErr) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]interface{}{
+						"type":      "pii_violation",
+						"message":   "Request blocked: PII detected in goal",
+						"pii_types": piiErr.PIITypes,
+					},
+				})
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

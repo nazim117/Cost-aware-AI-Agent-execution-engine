@@ -31,11 +31,16 @@ func main() {
 	mux.HandleFunc("/metrics", handlers.MetricsHandler(m))
 	mux.HandleFunc("/health", handleHealth)
 
+	// ReadTimeout covers reading the request body.
+	// WriteTimeout must be long enough for a full agent run:
+	// each LLM step can take 10-30s, and a graph may have many steps.
+	// Set a generous ceiling; real budget/latency enforcement happens
+	// inside the policy engine and runner, not at the HTTP layer.
 	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 5 * time.Minute,
 	}
 
 	log.Printf("Agent Executor listening on :%s", port)
