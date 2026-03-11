@@ -14,7 +14,6 @@ import (
 	"gateway/internal/scanner"
 )
 
-// OpenAI API types
 type ChatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
