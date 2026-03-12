@@ -3,9 +3,13 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"mcp-server/internal/mcp"
@@ -13,38 +17,120 @@ import (
 
 var webClient = &http.Client{Timeout: 15 * time.Second}
 
-// webSearch queries the DuckDuckGo Instant Answer API (no key required).
-// It returns titles, URLs, and snippets for the top results.
+// Compiled once at startup — used by ddgHtmlSearch.
+// DDG lite uses single-quoted class attributes; href precedes the class.
+var (
+	// Matches: href="//duckduckgo.com/l/?uddg=...&amp;rut=..." class='result-link'>Title</a>
+	reDDGLink    = regexp.MustCompile(`href="(//duckduckgo\.com/l/\?uddg=[^"]+)"[^>]*class='result-link'>([^<]+)</a>`)
+	reDDGSnippet = regexp.MustCompile(`class='result-snippet'[^>]*>([\s\S]*?)</td>`)
+	reHTMLTags   = regexp.MustCompile(`<[^>]*>`)
+)
+
+// webSearch dispatches to the best available search backend:
+//  1. Brave Search API  — when BRAVE_SEARCH_API_KEY is set (recommended, free tier)
+//  2. DuckDuckGo HTML   — scraped from lite.duckduckgo.com, no key required
 func webSearch(args map[string]any) (mcp.ToolCallResult, error) {
 	query, errResult, err := requireString(args, "query")
 	if errResult != nil {
 		return *errResult, err
 	}
 	limit := int(optionalFloat(args, "limit", 5))
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 10 {
+		limit = 10
+	}
 
-	// DuckDuckGo Instant Answer API — free, no key needed.
+	if apiKey := os.Getenv("BRAVE_SEARCH_API_KEY"); apiKey != "" {
+		return braveSearch(query, limit, apiKey)
+	}
+	return ddgHtmlSearch(query, limit)
+}
+
+// braveSearch calls the Brave Search API (https://api.search.brave.com).
+// Free tier: 2 000 queries/month — sign up at search.brave.com/webmaster.
+func braveSearch(query string, limit int, apiKey string) (mcp.ToolCallResult, error) {
 	apiURL := fmt.Sprintf(
-		"https://api.duckduckgo.com/?q=%s&format=json&no_redirect=1&no_html=1&skip_disambig=1",
-		url.QueryEscape(query),
+		"https://api.search.brave.com/res/v1/web/search?q=%s&count=%d&search_lang=en&result_filter=web",
+		url.QueryEscape(query), limit,
 	)
-
-	resp, err := webClient.Get(apiURL)
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return textErr(fmt.Sprintf("search request failed: %v", err))
+		return textErr(fmt.Sprintf("brave: build request: %v", err))
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Subscription-Token", apiKey)
+
+	resp, err := webClient.Do(req)
+	if err != nil {
+		return textErr(fmt.Sprintf("brave: request failed: %v", err))
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return textErr(fmt.Sprintf("brave: status %d: %s", resp.StatusCode, string(body)))
+	}
+
+	var data struct {
+		Web struct {
+			Results []struct {
+				Title       string `json:"title"`
+				URL         string `json:"url"`
+				Description string `json:"description"`
+			} `json:"results"`
+		} `json:"web"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return textErr(fmt.Sprintf("brave: decode response: %v", err))
+	}
+
+	type result struct {
+		Title   string `json:"title"`
+		URL     string `json:"url"`
+		Snippet string `json:"snippet"`
+	}
+	var results []result
+	for _, r := range data.Web.Results {
+		if len(results) >= limit {
+			break
+		}
+		results = append(results, result{Title: r.Title, URL: r.URL, Snippet: r.Description})
+	}
+
+	return textResult(map[string]any{"query": query, "count": len(results), "results": results})
+}
+
+// ddgHtmlSearch scrapes DuckDuckGo Lite (lite.duckduckgo.com), which returns
+// real web results without requiring an API key.
+func ddgHtmlSearch(query string, limit int) (mcp.ToolCallResult, error) {
+	req, err := http.NewRequest("GET",
+		"https://lite.duckduckgo.com/lite/?q="+url.QueryEscape(query),
+		nil,
+	)
 	if err != nil {
-		return textErr(fmt.Sprintf("read response failed: %v", err))
+		return textErr(fmt.Sprintf("ddg: build request: %v", err))
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return textErr(fmt.Sprintf("parse response failed: %v", err))
+	resp, err := webClient.Do(req)
+	if err != nil {
+		return textErr(fmt.Sprintf("ddg: request failed: %v", err))
 	}
+	defer resp.Body.Close()
 
-	// Extract related topics as the search results.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return textErr(fmt.Sprintf("ddg: read body: %v", err))
+	}
+	content := string(body)
+
+	linkMatches := reDDGLink.FindAllStringSubmatch(content, -1)
+	snippetMatches := reDDGSnippet.FindAllStringSubmatch(content, -1)
+
 	type result struct {
 		Title   string `json:"title"`
 		URL     string `json:"url"`
@@ -52,43 +138,56 @@ func webSearch(args map[string]any) (mcp.ToolCallResult, error) {
 	}
 	var results []result
 
-	// Abstract (top answer)
-	if abstract, ok := raw["Abstract"].(string); ok && abstract != "" {
-		results = append(results, result{
-			Title:   fmt.Sprintf("%v", raw["Heading"]),
-			URL:     fmt.Sprintf("%v", raw["AbstractURL"]),
-			Snippet: abstract,
-		})
-	}
-
-	// Related topics
-	if topics, ok := raw["RelatedTopics"].([]any); ok {
-		for _, t := range topics {
-			if len(results) >= limit {
-				break
-			}
-			m, ok := t.(map[string]any)
-			if !ok {
-				continue
-			}
-			text, _ := m["Text"].(string)
-			firstURL, _ := m["FirstURL"].(string)
-			if text == "" {
-				continue
-			}
-			results = append(results, result{
-				Title:   text,
-				URL:     firstURL,
-				Snippet: text,
-			})
+	for i, m := range linkMatches {
+		if len(results) >= limit {
+			break
 		}
+		// m[1] = href value (still HTML-encoded), m[2] = title text
+		actualURL := decodeDDGURL(html.UnescapeString(m[1]))
+		if actualURL == "" {
+			continue
+		}
+		title := cleanText(html.UnescapeString(m[2]))
+		if title == "" {
+			continue
+		}
+		snippet := ""
+		if i < len(snippetMatches) {
+			snippet = cleanText(html.UnescapeString(snippetMatches[i][1]))
+		}
+		results = append(results, result{Title: title, URL: actualURL, Snippet: snippet})
 	}
 
-	return textResult(map[string]any{
-		"query":   query,
-		"count":   len(results),
-		"results": results,
-	})
+	return textResult(map[string]any{"query": query, "count": len(results), "results": results})
+}
+
+// decodeDDGURL extracts the real destination URL from a DDG redirect link.
+// DDG lite uses the format //duckduckgo.com/l/?uddg=<percent-encoded-url>.
+func decodeDDGURL(href string) string {
+	if strings.HasPrefix(href, "//") {
+		href = "https:" + href
+	}
+	parsed, err := url.Parse(href)
+	if err != nil {
+		return ""
+	}
+	if target := parsed.Query().Get("uddg"); target != "" {
+		if decoded, err := url.QueryUnescape(target); err == nil {
+			return decoded
+		}
+		return target
+	}
+	// href was already an absolute URL (rare but possible)
+	if strings.HasPrefix(href, "http") {
+		return href
+	}
+	return ""
+}
+
+// cleanText strips HTML tags and collapses whitespace.
+func cleanText(s string) string {
+	s = reHTMLTags.ReplaceAllString(s, " ")
+	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
 }
 
 // webFetch fetches the raw text content of a URL.
@@ -105,7 +204,13 @@ func webFetch(args map[string]any) (mcp.ToolCallResult, error) {
 		return textErr(fmt.Sprintf("invalid URL %q: %v", rawURL, err))
 	}
 
-	resp, err := webClient.Get(rawURL)
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return textErr(fmt.Sprintf("build request failed: %v", err))
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ResearchBot/1.0)")
+
+	resp, err := webClient.Do(req)
 	if err != nil {
 		return textErr(fmt.Sprintf("fetch failed: %v", err))
 	}
@@ -130,7 +235,7 @@ func webDefinitions() []mcp.ToolDefinition {
 	return []mcp.ToolDefinition{
 		{
 			Name:        "web_search",
-			Description: "Search the web for a query and return titles, URLs, and snippets for the top results. Use this during the execute step when the agent needs current information.",
+			Description: "Search the web for current information and return titles, URLs, and snippets. Uses Brave Search API if BRAVE_SEARCH_API_KEY is set, otherwise falls back to DuckDuckGo. Use during execute steps when the agent needs real-time or recent information.",
 			InputSchema: mcp.JSONSchema{
 				Type: "object",
 				Properties: map[string]mcp.Property{
@@ -142,7 +247,7 @@ func webDefinitions() []mcp.ToolDefinition {
 		},
 		{
 			Name:        "web_fetch",
-			Description: "Fetch the content of a URL and return it as text. Use this to read a specific page or API endpoint found via web_search. Responses are capped at 100 KB.",
+			Description: "Fetch the content of a URL and return it as text. Use to read a specific page or API endpoint found via web_search. Responses are capped at 100 KB.",
 			InputSchema: mcp.JSONSchema{
 				Type: "object",
 				Properties: map[string]mcp.Property{

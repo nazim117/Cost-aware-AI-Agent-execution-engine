@@ -1,8 +1,13 @@
 FROM golang:1.25-alpine AS builder
 
+ARG SERVICE
+
 WORKDIR /app
 
-COPY . .
+# copy only the specific service
+COPY services/${SERVICE} ./service
+
+WORKDIR /app/service
 
 RUN go mod tidy
 
@@ -13,8 +18,8 @@ FROM gcr.io/distroless/static:nonroot
 
 WORKDIR /app
 
-COPY --from=builder /app/app /app/app
+COPY --from=builder /app/service/app /app
 
-EXPOSE 8083
+EXPOSE 8080
 
 ENTRYPOINT ["/app/app"]

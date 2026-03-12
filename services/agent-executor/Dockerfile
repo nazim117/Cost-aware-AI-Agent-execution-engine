@@ -1,26 +1,19 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-# Copy go.mod first (always exists)
-COPY go.mod ./
+COPY go.work ./
+COPY services ./services
 
-# Copy go.sum only if it exists
-# (Docker doesn't support conditionals, so we copy everything later)
-RUN go mod download || true
+WORKDIR /app/services/${SERVICE}
 
-# Copy the rest of the service
-COPY . .
+RUN go mod download
 
-# Build the binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o app ./cmd/server
 
-# ---- Runtime image ----
 FROM gcr.io/distroless/static:nonroot
-
 WORKDIR /app
-COPY --from=builder /app/app /app
-
-EXPOSE 8081
+COPY --from=builder /app/services/${SERVICE}/app /app
+EXPOSE 8080
 ENTRYPOINT ["/app"]

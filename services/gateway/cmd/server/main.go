@@ -14,25 +14,81 @@ import (
 	"gateway/internal/scanner"
 )
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Chat-related types ---
+
+// Property describes a single field in a JSON Schema (subset used for tools).
+type Property struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+}
+
+// JSONSchema describes the parameters object for a tool function.
+type JSONSchema struct {
+	Type       string              `json:"type"`
+	Properties map[string]Property `json:"properties,omitempty"`
+	Required   []string            `json:"required,omitempty"`
+}
+
+// ToolFunction represents a function exposed to the LLM.
+type ToolFunction struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Parameters  JSONSchema `json:"parameters"`
+}
+
+// Tool is one entry in the tools array of a chat request.
+type Tool struct {
+	Type     string       `json:"type"` // usually "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolCallFunction holds the LLM's chosen function name and JSON-encoded args.
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ToolCall is one function-call requested by the LLM in a response.
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+// Message mirrors the OpenAI-style chat message. It includes optional
+// tool-related fields so the gateway can forward assistant tool_call
+// messages unchanged to the upstream LLM and back to clients.
+type Message struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// ChatRequest is the payload sent to the gateway's /v1/chat/completions endpoint.
+// We accept an optional `tools` array and `tool_choice` so callers (the agent)
+// can surface MCP tool definitions to the model.
 type ChatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
-}
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ChatResponse struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
-	Usage   Usage    `json:"usage"`
+	Tools       []Tool    `json:"tools,omitempty"`
+	ToolChoice  string    `json:"tool_choice,omitempty"`
 }
 
 type Choice struct {
@@ -45,6 +101,15 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+}
+
+type ChatResponse struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Choices []Choice `json:"choices"`
+	Usage   Usage    `json:"usage"`
 }
 
 // Gateway Server
@@ -199,8 +264,9 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 func main() {
 	gateway := NewGateway()
 
-	http.HandleFunc("/v1/chat/completions", gateway.handleChat)
-	http.HandleFunc("/health", gateway.handleHealth)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", gateway.handleChat)
+	mux.HandleFunc("/health", gateway.handleHealth)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -209,5 +275,5 @@ func main() {
 
 	log.Printf("AI Gateway starting on port %s", port)
 	log.Printf("Block on PII: %v", gateway.blockOnPII)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
 }
