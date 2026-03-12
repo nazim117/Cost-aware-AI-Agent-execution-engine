@@ -23,11 +23,58 @@ import (
 	"time"
 )
 
+// --- Tool calling types ---
+
+// Property describes a single field in a JSON Schema.
+type Property struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+}
+
+// JSONSchema is the parameter schema sent to the LLM for a tool.
+type JSONSchema struct {
+	Type       string              `json:"type"`
+	Properties map[string]Property `json:"properties,omitempty"`
+	Required   []string            `json:"required,omitempty"`
+}
+
+// ToolFunction is the function definition inside a Tool.
+type ToolFunction struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Parameters  JSONSchema `json:"parameters"`
+}
+
+// Tool is one entry in the tools array of a chat request.
+type Tool struct {
+	Type     string       `json:"type"` // "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolCallFunction holds the LLM's chosen function name and JSON-encoded args.
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // JSON string
+}
+
+// ToolCall is one function-call requested by the LLM in a response.
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+// --- Chat types ---
+
 // Message mirrors the OpenAI chat message shape used by both the gateway and
-// the upstream LLM API.
+// the upstream LLM API. Content is omitempty because assistant messages that
+// request tool calls may have an empty/null content field.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
 }
 
 // ChatRequest is the payload sent to the gateway's /v1/chat/completions endpoint.
@@ -36,6 +83,8 @@ type ChatRequest struct {
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Tools       []Tool    `json:"tools,omitempty"`
+	ToolChoice  string    `json:"tool_choice,omitempty"`
 }
 
 // ChatResponse is the response returned by the gateway (which proxies the
@@ -100,7 +149,8 @@ var DefaultClient *Client
 const defaultGatewayURL = "http://localhost:8082"
 
 // InitDefault initialises DefaultClient from the GATEWAY_URL environment
-// variable, falling back to http://localhost:8082 if the variable is not set.
+// variable. If the variable is not set, DefaultClient is left nil so that
+// callers can detect the absence and fall back to the local LLM path.
 // Safe to call multiple times; subsequent calls after the first are no-ops.
 func InitDefault() {
 	if DefaultClient != nil {
@@ -108,13 +158,13 @@ func InitDefault() {
 	}
 	url := os.Getenv("GATEWAY_URL")
 	if url == "" {
-		url = defaultGatewayURL
+		return // not configured; caller falls back to direct LLM path
 	}
 	DefaultClient = New(url)
 }
 
-// Available returns true if a gateway client has been initialised (i.e.
-// GATEWAY_URL was set at startup). Use this to decide whether to route through
+// Available returns true only when GATEWAY_URL was set at startup and
+// InitDefault has been called. Use this to decide whether to route through
 // the gateway or fall back to a direct LLM call.
 func Available() bool {
 	return DefaultClient != nil

@@ -62,10 +62,21 @@ type AgentRunResponse struct {
 	Steps          []AgentStepRun `json:"steps"`
 }
 
+// ToolCallTrace records a single MCP tool invocation made during a step.
+type ToolCallTrace struct {
+	ToolName  string         `json:"tool_name"`
+	Arguments map[string]any `json:"arguments,omitempty"`
+	Result    string         `json:"result"`
+	IsError   bool           `json:"is_error,omitempty"`
+	LatencyMs int64          `json:"latency_ms"`
+}
+
 type AgentStepRun struct {
-	Step      string  `json:"step"`
-	ModelTier string  `json:"model_tier"`
-	Cost      float64 `json:"cost"`
-	LatencyMs int64   `json:"latency_ms"`
-	Decision  string  `json:"decision"`
+	Step      string          `json:"step"`
+	ModelTier string          `json:"model_tier"`
+	Cost      float64         `json:"cost"`
+	LatencyMs int64           `json:"latency_ms"`
+	Decision  string          `json:"decision"`
+	Content   string          `json:"content"`
+	ToolCalls []ToolCallTrace `json:"tool_calls,omitempty"`
 }

@@ -1,12 +1,15 @@
 package agent
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"agent-executor/internal/gatewayclient"
 	"agent-executor/internal/llmclient"
+	"agent-executor/internal/mcpclient"
 	"agent-executor/internal/metrics"
 	"agent-executor/internal/policyclient"
 	"agent-executor/internal/types"
@@ -68,6 +71,7 @@ func RunAgent(
 	remainingBudget := req.Budget
 	var totalCost float64
 	var trace []types.AgentStepRun
+	var result string
 
 	// Traverse the graph starting at the entry node.
 	currentName := graph.Entry
@@ -91,12 +95,6 @@ func RunAgent(
 			return nil, err
 		}
 
-		// Compute remaining budget ratio for edge condition evaluation.
-		remainingRatio := 0.0
-		if req.Budget > 0 {
-			remainingRatio = remainingBudget / req.Budget
-		}
-
 		// Determine whether this step is executable. If the cheapest possible tier
 		// already exceeds the remaining budget, treat it as a hard stop so the graph
 		// can route gracefully (e.g. OnHardStop edge to summarize) rather than
@@ -107,15 +105,24 @@ func RunAgent(
 
 		hardStop := decision.Decision.HardStop || affordabilityStop
 
-		// Resolve the next node before potentially breaking out of the loop.
-		// This allows OnHardStop edges to redirect to a graceful exit step
-		// rather than halting abruptly.
-		currentName = nextStep(node, remainingRatio, hardStop)
-
 		if hardStop {
 			m.IncHardStop()
-			// If OnHardStop redirected us somewhere (e.g. summarize), continue.
-			// Otherwise we're done.
+			// Emit a trace record with an empty ModelTier so the frontend can
+			// render the node in a "stopped" state rather than leaving it grey
+			// as if it were never visited.
+			trace = append(trace, types.AgentStepRun{
+				Step:      node.Name,
+				ModelTier: "",
+				Cost:      0,
+				LatencyMs: 0,
+				Decision:  decision.Reason,
+				Content:   "",
+			})
+			remainingRatio := 0.0
+			if req.Budget > 0 {
+				remainingRatio = remainingBudget / req.Budget
+			}
+			currentName = nextStep(node, remainingRatio, true)
 			continue
 		}
 
@@ -140,16 +147,18 @@ func RunAgent(
 		latency := latencyByTier[tier]
 		startTime := time.Now()
 
-		_, err = callLLMWithPIIScanning(req.Goal, stepType, tier, node.Name)
-		actualLatency := time.Since(startTime)
-
+		content, toolCalls, err := callLLMWithPIIScanning(req.Goal, stepType, tier, node.Name)
 		if err != nil {
 			return nil, err
 		}
 
+		actualLatency := time.Since(startTime)
 		if actualLatency < latency {
 			time.Sleep(latency - actualLatency)
 		}
+		// recordedLatency is the true wall-clock time for this step,
+		// always >= the simulated tier floor after the conditional sleep above.
+		recordedLatency := time.Since(startTime)
 
 		cost := costByTier[tier]
 
@@ -164,19 +173,30 @@ func RunAgent(
 			m.AddCostSaved(baselineCost - cost)
 		}
 
+		// Evaluate the next node AFTER deducting this step's cost so that
+		// budget_ratio_below edge conditions see the up-to-date remaining ratio.
+		remainingRatio := 0.0
+		if req.Budget > 0 {
+			remainingRatio = remainingBudget / req.Budget
+		}
+		currentName = nextStep(node, remainingRatio, false)
+
 		trace = append(trace, types.AgentStepRun{
-			Step:      node.Name, // use node name in trace for full visibility
+			Step:      node.Name,
 			ModelTier: tier,
 			Cost:      cost,
-			LatencyMs: latency.Milliseconds(),
+			LatencyMs: recordedLatency.Milliseconds(),
 			Decision:  decision.Reason,
+			Content:   content,
+			ToolCalls: toolCalls,
 		})
+		result = content
 	}
 
 	totalLatency := time.Since(start)
 
 	return &types.AgentRunResponse{
-		Result:         "simulated agent result",
+		Result:         result,
 		TotalCost:      totalCost,
 		TotalLatencyMs: totalLatency.Milliseconds(),
 		Steps:          trace,
@@ -185,21 +205,28 @@ func RunAgent(
 
 // callLLMWithPIIScanning is the single choke-point through which every LLM
 // call in the agent-executor must pass.  It enforces PII hygiene before any
-// text reaches the model:
+// text reaches the model and drives the multi-turn tool-call loop when MCP
+// tools are available.
+//
+// Returns the final text content, the list of MCP tool calls made (if any),
+// and any error.
 //
 //  1. Gateway path (preferred, when GATEWAY_URL is set):
 //     The full chat request is sent to the gateway service, which performs its
 //     own PII scan, blocks or redacts as configured, emits an audit log entry,
-//     and forwards the cleaned request to the upstream LLM.  The agent-executor
-//     never touches the LLM directly in this path.
+//     and forwards the cleaned request to the upstream LLM.  When MCP tools are
+//     available (MCP_SERVER_URL is set), the tools array is included in the
+//     request and the response is checked for tool_calls.  Tool calls are
+//     dispatched to the MCP server and their results appended as "tool" messages
+//     before re-calling the LLM, up to maxToolIter times.
 //
 //  2. Local fallback (when GATEWAY_URL is not set):
-//     The llmclient's built-in PIIScanner runs first.  The redacted text (not
-//     the original goal) is used in the chat request.  blockOnPII=true means
-//     any PII in the goal causes an immediate error rather than a silent pass.
-func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, error) {
-	// Ensure clients are initialised.  Both are no-ops after the first call.
+//     The llmclient's built-in PIIScanner runs first.  Tool dispatch is not
+//     supported in this path.
+func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []types.ToolCallTrace, error) {
+	// Ensure clients are initialised (all are no-ops after the first call).
 	gatewayclient.InitDefault()
+	mcpclient.InitDefault()
 	if llmclient.DefaultClient == nil {
 		llmclient.InitDefault()
 	}
@@ -207,43 +234,124 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, erro
 	systemPrompt := getSystemPromptForStep(stepType)
 	model := modelByTier[tier]
 
-	// --- Gateway path ---
-	// When a gateway is available, hand off the entire request.  The gateway
-	// is the authoritative PII enforcement point; we do not run a second local
-	// scan on top of it.
+	// ── Gateway path ─────────────────────────────────────────────────────────
 	if gatewayclient.Available() {
-		req := gatewayclient.ChatRequest{
-			Model: model,
-			Messages: []gatewayclient.Message{
-				{Role: "system", Content: systemPrompt},
-				{Role: "user", Content: goal},
-			},
-			Temperature: 0.7,
-			MaxTokens:   1024,
+		msgs := []gatewayclient.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: goal},
 		}
-		resp, err := gatewayclient.DefaultClient.Chat(req)
-		if err != nil {
-			return "", err
+
+		// Fetch MCP tool definitions and convert to the OpenAI tools format.
+		var tools []gatewayclient.Tool
+		if mcpclient.Available() {
+			if mcpTools, err := mcpclient.DefaultClient.ListTools(); err == nil {
+				for _, t := range mcpTools {
+					props := make(map[string]gatewayclient.Property, len(t.InputSchema.Properties))
+					for k, v := range t.InputSchema.Properties {
+						props[k] = gatewayclient.Property{
+							Type:        v.Type,
+							Description: v.Description,
+						}
+					}
+					tools = append(tools, gatewayclient.Tool{
+						Type: "function",
+						Function: gatewayclient.ToolFunction{
+							Name:        t.Name,
+							Description: t.Description,
+							Parameters: gatewayclient.JSONSchema{
+								Type:       t.InputSchema.Type,
+								Properties: props,
+								Required:   t.InputSchema.Required,
+							},
+						},
+					})
+				}
+			}
 		}
-		if len(resp.Choices) > 0 {
-			return resp.Choices[0].Message.Content, nil
+
+		var allToolCalls []types.ToolCallTrace
+		const maxToolIter = 8
+
+		for iter := 0; iter < maxToolIter; iter++ {
+			chatReq := gatewayclient.ChatRequest{
+				Model:       model,
+				Messages:    msgs,
+				Temperature: 0.7,
+				MaxTokens:   1024,
+			}
+			if len(tools) > 0 {
+				chatReq.Tools = tools
+				chatReq.ToolChoice = "auto"
+			}
+
+			resp, err := gatewayclient.DefaultClient.Chat(chatReq)
+			if err != nil {
+				return "", allToolCalls, err
+			}
+			if len(resp.Choices) == 0 {
+				return "", allToolCalls, nil
+			}
+
+			choice := resp.Choices[0]
+
+			// No tool calls — conversation complete.
+			if choice.FinishReason != "tool_calls" || len(choice.Message.ToolCalls) == 0 {
+				return choice.Message.Content, allToolCalls, nil
+			}
+
+			// Append the assistant's tool-call message to the conversation.
+			msgs = append(msgs, choice.Message)
+
+			// Dispatch each requested tool call to the MCP server.
+			for _, tc := range choice.Message.ToolCalls {
+				var args map[string]any
+				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+				tcStart := time.Now()
+				mcpResult, callErr := mcpclient.DefaultClient.CallTool(tc.Function.Name, args)
+				tcLatency := time.Since(tcStart)
+
+				resultText := ""
+				isError := false
+				if callErr != nil {
+					resultText = callErr.Error()
+					isError = true
+				} else if len(mcpResult.Content) > 0 {
+					resultText = mcpResult.Content[0].Text
+					isError = mcpResult.IsError
+				}
+
+				allToolCalls = append(allToolCalls, types.ToolCallTrace{
+					ToolName:  tc.Function.Name,
+					Arguments: args,
+					Result:    resultText,
+					IsError:   isError,
+					LatencyMs: tcLatency.Milliseconds(),
+				})
+
+				// Append the tool result so the LLM can continue.
+				msgs = append(msgs, gatewayclient.Message{
+					Role:       "tool",
+					Content:    resultText,
+					ToolCallID: tc.ID,
+					Name:       tc.Function.Name,
+				})
+			}
 		}
-		return "", nil
+
+		return "", allToolCalls, fmt.Errorf("agent: max tool-call iterations (%d) reached for step %q", maxToolIter, stepName)
 	}
 
-	// --- Local fallback path ---
-	// Run the local PII scanner.  Use the *redacted* text in the request so
-	// that raw PII is never forwarded to the LLM even if blockOnPII is false.
+	// ── Local fallback path (no tool dispatch) ────────────────────────────────
+	// Run the local PII scanner.  Use the *redacted* text so that raw PII is
+	// never forwarded to the LLM even when blockOnPII is false.
 	redactedGoal, piiTypes, err := llmclient.DefaultClient.ScanPrompt(goal)
 	if err != nil {
-		// ScanPrompt returns an error only when PII is found and blockOnPII=true.
-		return "", err
+		return "", nil, err
 	}
 
 	userContent := redactedGoal
 	if len(piiTypes) > 0 {
-		// Prefix lets downstream consumers know redaction occurred without
-		// leaking what was redacted.
 		userContent = "[PII REDACTED] " + redactedGoal
 	}
 
@@ -259,14 +367,13 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, erro
 
 	resp, err := llmclient.DefaultClient.Chat(req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	if len(resp.Choices) > 0 {
-		return resp.Choices[0].Message.Content, nil
+		return resp.Choices[0].Message.Content, nil, nil
 	}
-
-	return "", nil
+	return "", nil, nil
 }
 
 func getSystemPromptForStep(stepType string) string {
