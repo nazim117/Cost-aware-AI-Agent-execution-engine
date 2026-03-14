@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"agent-executor/internal/policyclient"
 	"agent-executor/internal/types"
 )
+
+const maxToolResultChars = 8000 // Limit tool result to avoid hitting LLM context limits
 
 var costByTier = map[string]float64{
 	"cheap":    0.005,
@@ -72,6 +75,7 @@ func RunAgent(
 	var totalCost float64
 	var trace []types.AgentStepRun
 	var result string
+	var accumulatedContext string
 
 	// Traverse the graph starting at the entry node.
 	currentName := graph.Entry
@@ -90,10 +94,15 @@ func RunAgent(
 		policyReq.Budget.Remaining = remainingBudget
 		policyReq.Request.LatencySLAMs = req.LatencySLAMs
 
+		log.Printf("[runner] Step=%s, Budget.Total=%v, Remaining=%v", stepType, req.Budget, remainingBudget)
+
 		decision, err := policy.Evaluate(policyReq)
 		if err != nil {
 			return nil, err
 		}
+
+		log.Printf("[runner] Decision: SelectedTier=%s, HardStop=%v, Reason=%s",
+			decision.Decision.SelectedModelTier, decision.Decision.HardStop, decision.Reason)
 
 		// Determine whether this step is executable. If the cheapest possible tier
 		// already exceeds the remaining budget, treat it as a hard stop so the graph
@@ -102,6 +111,8 @@ func RunAgent(
 		cheapestCost := costByTier["cheap"]
 		affordabilityStop := costByTier[decision.Decision.SelectedModelTier] > remainingBudget &&
 			cheapestCost > remainingBudget
+
+		log.Printf("[runner] cheapestCost=%v, affordabilityStop=%v", cheapestCost, affordabilityStop)
 
 		hardStop := decision.Decision.HardStop || affordabilityStop
 
@@ -147,9 +158,16 @@ func RunAgent(
 		latency := latencyByTier[tier]
 		startTime := time.Now()
 
-		content, toolCalls, err := callLLMWithPIIScanning(req.Goal, stepType, tier, node.Name)
+		// Then in the step execution block, after getting content back:
+		content, toolCalls, err := callLLMWithPIIScanning(req.Goal, stepType, tier, node.Name, accumulatedContext)
 		if err != nil {
 			return nil, err
+		}
+		if content != "" {
+			if accumulatedContext != "" {
+				accumulatedContext += "\n\n---\n\n"
+			}
+			accumulatedContext += fmt.Sprintf("[%s step]:\n%s", node.Name, content)
 		}
 
 		actualLatency := time.Since(startTime)
@@ -223,7 +241,7 @@ func RunAgent(
 //  2. Local fallback (when GATEWAY_URL is not set):
 //     The llmclient's built-in PIIScanner runs first.  Tool dispatch is not
 //     supported in this path.
-func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []types.ToolCallTrace, error) {
+func callLLMWithPIIScanning(goal, stepType, tier, stepName, priorContext string) (string, []types.ToolCallTrace, error) {
 	// Ensure clients are initialised (all are no-ops after the first call).
 	gatewayclient.InitDefault()
 	mcpclient.InitDefault()
@@ -236,14 +254,18 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 
 	// ── Gateway path ─────────────────────────────────────────────────────────
 	if gatewayclient.Available() {
+		userMsg := goal
+		if priorContext != "" {
+			userMsg = "Original goal: " + goal + "\n\nFindings from previous steps:\n" + priorContext
+		}
 		msgs := []gatewayclient.Message{
 			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: goal},
+			{Role: "user", Content: userMsg},
 		}
 
 		// Fetch MCP tool definitions and convert to the OpenAI tools format.
 		var tools []gatewayclient.Tool
-		if mcpclient.Available() {
+		if mcpclient.Available() && stepType == "execute" {
 			if mcpTools, err := mcpclient.DefaultClient.ListTools(); err == nil {
 				for _, t := range mcpTools {
 					props := make(map[string]gatewayclient.Property, len(t.InputSchema.Properties))
@@ -270,7 +292,7 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 		}
 
 		var allToolCalls []types.ToolCallTrace
-		const maxToolIter = 8
+		const maxToolIter = 5
 
 		for iter := 0; iter < maxToolIter; iter++ {
 			chatReq := gatewayclient.ChatRequest{
@@ -294,8 +316,11 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 
 			choice := resp.Choices[0]
 
+			log.Printf("[runner] iter=%d, finishReason=%q, toolCallsCount=%d", iter, choice.FinishReason, len(choice.Message.ToolCalls))
+
 			// No tool calls — conversation complete.
 			if choice.FinishReason != "tool_calls" || len(choice.Message.ToolCalls) == 0 {
+				log.Printf("[runner] No tool calls in response, returning content directly")
 				return choice.Message.Content, allToolCalls, nil
 			}
 
@@ -306,6 +331,8 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 			for _, tc := range choice.Message.ToolCalls {
 				var args map[string]any
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+				log.Printf("[runner] iter=%d, tool=%s, args=%v", iter, tc.Function.Name, args)
 
 				tcStart := time.Now()
 				mcpResult, callErr := mcpclient.DefaultClient.CallTool(tc.Function.Name, args)
@@ -320,6 +347,14 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 					resultText = mcpResult.Content[0].Text
 					isError = mcpResult.IsError
 				}
+
+				// Truncate result if too long to avoid hitting LLM context limits
+				if len(resultText) > maxToolResultChars {
+					resultText = resultText[:maxToolResultChars] + "\n[...truncated for length...]"
+					log.Printf("[runner] iter=%d, toolResult TRUNCATED from %d to %d chars", iter, len(mcpResult.Content[0].Text), maxToolResultChars)
+				}
+
+				log.Printf("[runner] iter=%d, toolResultLength=%d, isError=%v", iter, len(resultText), isError)
 
 				allToolCalls = append(allToolCalls, types.ToolCallTrace{
 					ToolName:  tc.Function.Name,
@@ -339,7 +374,28 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 			}
 		}
 
-		return "", allToolCalls, fmt.Errorf("agent: max tool-call iterations (%d) reached for step %q", maxToolIter, stepName)
+		log.Printf("[runner] max tool iterations (%d) reached for step %q, forcing final synthesis", maxToolIter, stepName)
+		msgs = append(msgs, gatewayclient.Message{
+			Role:    "user",
+			Content: "Based on all the tool results above, provide a clear and direct answer to the original question. Do not call any more tools.",
+		})
+		finalReq := gatewayclient.ChatRequest{
+			Model:       model,
+			Messages:    msgs,
+			Temperature: 0.3, // lower temp for factual synthesis
+			MaxTokens:   512,
+		}
+		finalResp, err := gatewayclient.DefaultClient.Chat(finalReq)
+		if err != nil || len(finalResp.Choices) == 0 {
+			// fallback to the last assistant message if synthesis call fails
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "assistant" && msgs[i].Content != "" {
+					return msgs[i].Content, allToolCalls, nil
+				}
+			}
+			return "", allToolCalls, nil
+		}
+		return finalResp.Choices[0].Message.Content, allToolCalls, nil
 	}
 
 	// ── Local fallback path (no tool dispatch) ────────────────────────────────
@@ -379,12 +435,20 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName string) (string, []ty
 func getSystemPromptForStep(stepType string) string {
 	switch stepType {
 	case "plan":
-		return "You are a planning agent. Analyze the user's request and create a detailed plan with steps."
+		return "You are a planning agent. You MUST use the available tools to gather real information — never answer from memory. For weather: call http_request with url=https://wttr.in/{city}?format=j1. Replace {city} with the actual city name using + for spaces (e.g. New+York)."
 	case "execute":
-		return "You are an execution agent. Carry out the given plan and provide results."
+		return `You are an execution agent with access to tools. You MUST use tools to answer — never answer from memory or training data.
+Rules:
+- ALWAYS call a tool first. Never respond with text before calling at least one tool.
+- For weather: call http_request with url="https://wttr.in/{city}?format=j1" (e.g. https://wttr.in/London?format=j1)
+- For web research: call web_search first, then web_fetch on the most relevant result.
+- After receiving tool results, provide a clear answer based on the actual data returned.
+- Do NOT call more tools after you have the data you need.`
+	case "synthesize":
+		return "You are a synthesis agent. Combine all tool results and information gathered in previous steps into a coherent, detailed response. Do NOT call any tools."
 	case "summarize":
-		return "You are a summarization agent. Summarize the results concisely."
+		return "You are a summarization agent. Summarize the findings concisely. Do NOT call any tools — just synthesize what you already have."
 	default:
-		return "You are a helpful assistant."
+		return "You are a helpful assistant. Do NOT make tool calls unless absolutely necessary. After getting information, provide your answer immediately."
 	}
 }

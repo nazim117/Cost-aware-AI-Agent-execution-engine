@@ -9,7 +9,9 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8081',
         rewrite: path => path.replace(/^\/api/, ''),
-      }
+      },
+      '/agent': 'http://localhost:8081',
+      '/metrics': 'http://localhost:8081',
     }
   }
 })

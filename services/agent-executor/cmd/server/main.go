@@ -37,6 +37,10 @@ func main() {
 		port = "8081"
 	}
 
+	log.Printf("[main] GATEWAY_URL=%s", os.Getenv("GATEWAY_URL"))
+	log.Printf("[main] MCP_SERVER_URL=%s", os.Getenv("MCP_SERVER_URL"))
+	log.Printf("[main] POLICY_ENGINE_URL=%s", os.Getenv("POLICY_ENGINE_URL"))
+
 	mux := http.NewServeMux()
 	m := metrics.New()
 
