@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import ReactMarkdown from "react-markdown";
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
 const MODELS = [
-  { id: "deepseek-chat",  label: "DeepSeek Chat",   tier: "standard", badge: "STD",  color: "#3b82f6" },
+  { id: "deepseek-chat",  label: "DeepSeek Chat",   tier: "free", badge: "FREE",  color: "#3b82f6" },
   { id: "deepseek-coder", label: "DeepSeek Coder",  tier: "premium",  badge: "PRO",  color: "#f97316" },
   { id: "deepseek-flash", label: "DeepSeek Flash",  tier: "cheap",    badge: "FAST", color: "#22c55e" },
 ];
@@ -176,7 +177,7 @@ function ExpandedStep({ name, step }) {
         fontFamily: "'JetBrains Mono', monospace",
         whiteSpace: "pre-wrap", maxHeight: "240px", overflowY: "auto",
       }}>
-        {step.content}
+        <ReactMarkdown>{step.content}</ReactMarkdown>
       </div>
 
       {/* Tool calls */}
@@ -477,9 +478,8 @@ function Message({ msg }) {
             borderRadius: isUser ? "12px 4px 12px 12px" : "4px 12px 12px 12px",
             fontSize: "14px", lineHeight: "1.7", color: "#e6edf3",
             fontFamily: "'JetBrains Mono', monospace",
-            whiteSpace: "pre-wrap",
           }}>
-            {msg.content}
+            <ReactMarkdown>{msg.content}</ReactMarkdown>
 
             {/* Thinking dots */}
             {msg.role === "assistant" && msg.thinking && (
@@ -555,7 +555,7 @@ export default function App() {
       role: "assistant",
       content: "",
       thinking: true,
-      thinkingText: "contacting policy-engine...",
+      thinkingText: "Thinking",
       steps: [],
       graph: selectedMode.graph,
     }]);

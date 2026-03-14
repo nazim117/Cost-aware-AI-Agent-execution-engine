@@ -146,6 +146,8 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("[gateway] Model=%s, ToolsCount=%d, ToolChoice=%q", req.Model, len(req.Tools), req.ToolChoice)
+
 	// 2. Scan all messages for PII using the canonical scanner package.
 	var allPII []string
 	for i, msg := range req.Messages {
@@ -196,9 +198,14 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		promptText = req.Messages[len(req.Messages)-1].Content
 	}
 	responseText := ""
+	finishReason := ""
+	toolCallsCount := 0
 	if len(resp.Choices) > 0 {
 		responseText = resp.Choices[0].Message.Content
+		finishReason = resp.Choices[0].FinishReason
+		toolCallsCount = len(resp.Choices[0].Message.ToolCalls)
 	}
+	log.Printf("[gateway] Response: finishReason=%q, toolCallsCount=%d", finishReason, toolCallsCount)
 
 	logger.LogRequest(logger.AuditLog{
 		Timestamp:   time.Now(),

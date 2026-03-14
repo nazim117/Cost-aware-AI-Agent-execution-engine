@@ -26,6 +26,7 @@ go.work.sum
 
 # env file
 services/gateway/.env
+services/agent-executor/.env
 
 # Audit logs produced by the gateway at runtime
 *.jsonl

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -157,10 +158,13 @@ func InitDefault() {
 		return
 	}
 	url := os.Getenv("GATEWAY_URL")
+	log.Printf("[gatewayclient] GATEWAY_URL = %q", url)
 	if url == "" {
+		log.Printf("[gatewayclient] GATEWAY_URL not set, caller falls back to direct LLM path")
 		return // not configured; caller falls back to direct LLM path
 	}
 	DefaultClient = New(url)
+	log.Printf("[gatewayclient] Initialized with URL: %s", url)
 }
 
 // Available returns true only when GATEWAY_URL was set at startup and

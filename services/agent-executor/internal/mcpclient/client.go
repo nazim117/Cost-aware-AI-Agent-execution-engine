@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -80,10 +81,13 @@ func InitDefault() {
 		return
 	}
 	url := os.Getenv("MCP_SERVER_URL")
+	log.Printf("[mcpclient] MCP_SERVER_URL = %q", url)
 	if url == "" {
+		log.Printf("[mcpclient] MCP_SERVER_URL not set, tool dispatch disabled")
 		return // not configured; tool dispatch disabled
 	}
 	DefaultClient = New(url)
+	log.Printf("[mcpclient] Initialized with URL: %s", url)
 }
 
 // Available returns true when an MCP server URL was provided at startup.
