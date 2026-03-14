@@ -25,6 +25,7 @@ services:
       - "8082:8082"
     environment:
       - PORT=8082
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - BLOCK_ON_PII=${BLOCK_ON_PII:-false}
       - AUDIT_LOG_PATH=/var/log/gateway/audit.jsonl
     volumes:
@@ -54,6 +55,7 @@ services:
       - "8081:8081"
     environment:
       - PORT=8081
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - POLICY_ENGINE_URL=http://policy-engine:8080
       - GATEWAY_URL=http://gateway:8082
       - MCP_SERVER_URL=http://mcp-server:8083
@@ -62,22 +64,6 @@ services:
       - gateway
       - mcp-server
     restart: unless-stopped
-
-#  agent-executor:
-#    build:
-#      context: ./services/agent-executor
-#      dockerfile: Dockerfile
-#    ports:
-#      - "8081:8081"
-#    environment:
-#      - PORT=8081
-#      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-#      - POLICY_ENGINE_URL=http://policy-engine:8080
-#      - GATEWAY_URL=http://gateway:8082
-#    depends_on:
-#      - policy-engine
-#      - gateway
-#    restart: unless-stopped
 
   dashboard:
     build: ./dashboard

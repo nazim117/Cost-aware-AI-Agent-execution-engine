@@ -2,12 +2,6 @@
 
 A lightweight control plane for AI agents that enforces **cost**, **latency**, **execution policies**, and **PII safety** before agent steps run.
 
-> **Note:** This project is **not** an agent framework. It is an **infrastructure layer** that sits in front of agents and decides:
-> - whether an agent step is allowed to run
-> - which model tier it may use
-> - when execution must stop to protect budget or SLAs
-> - whether a prompt contains PII that must be redacted or blocked before reaching the LLM
-
 ## What problem does this solve?
 
 **AI agents tend to:**
@@ -20,49 +14,53 @@ A lightweight control plane for AI agents that enforces **cost**, **latency**, *
 - budgets are enforced at runtime
 - latency SLAs influence model choice
 - execution degrades gracefully instead of failing
-- PII is scanned, redacted or blocked before any text reaches the model
+- PII is scanned, redacted, or blocked before any text reaches the model
 - every LLM call is audit-logged with PII detection results
 
 ## Architecture
 
-The system consists of **three services:**
+The system consists of **five services:**
 
 ```
 ┌─────────────┐     POST /agent/run      ┌───────────────────┐
-│   Client    │ ───────────────────────► │  agent-executor   │
-└─────────────┘                          │     :8081         │
-                                         └────────┬──────────┘
+│  dashboard  │ ───────────────────────► │  agent-executor   │
+│   :3000     │                          │     :8081         │
+└─────────────┘                          └────────┬──────────┘
                                                   │
-                          ┌───────────────────────┼──────────────────────┐
-                          │                       │                      │
-                          ▼                       ▼                      │
-              ┌───────────────────┐   ┌───────────────────┐             │
-              │  policy-engine    │   │     gateway        │             │
-              │     :8080         │   │     :8082          │             │
-              │                   │   │                    │             │
-              │  Evaluates step   │   │  Scans PII         │             │
-              │  against budget   │   │  Redacts/blocks    │             │
-              │  and latency SLA  │   │  Forwards to LLM   │◄────────────┘
-              │  Returns model    │   │  Audit logs every  │
-              │  tier decision    │   │  request           │
-              └───────────────────┘   └────────┬───────────┘
-                                               │
-                                               ▼
-                                    ┌───────────────────┐
-                                    │   DeepSeek API    │
-                                    │  (or any OpenAI-  │
-                                    │  compatible LLM)  │
-                                    └───────────────────┘
+                     ┌────────────────────────────┼──────────────────────┐
+                     │                            │                      │
+                     ▼                            ▼                      │
+         ┌───────────────────┐       ┌───────────────────┐              │
+         │  policy-engine    │       │     gateway        │              │
+         │     :8080         │       │     :8082          │              │
+         │                   │       │                    │              │
+         │  Evaluates step   │       │  Scans PII         │              │
+         │  against budget   │       │  Redacts/blocks    │◄─────────────┘
+         │  and latency SLA  │       │  Forwards to LLM   │
+         │  Returns model    │       │  Audit logs every  │
+         │  tier decision    │       │  request           │
+         └───────────────────┘       └────────┬───────────┘
+                                              │
+                     ┌────────────────────────┤
+                     │                        │
+                     ▼                        ▼
+         ┌───────────────────┐   ┌───────────────────┐
+         │   mcp-server      │   │   DeepSeek API    │
+         │     :8083         │   │  (or any OpenAI-  │
+         │                   │   │  compatible LLM)  │
+         │  Web search via   │   └───────────────────┘
+         │  Brave Search API │
+         └───────────────────┘
 ```
 
 ### agent-executor `:8081`
-- Orchestrates agent steps by traversing a configurable step graph
+- Orchestrates agent steps by bridging a configurable step graph
 - Asks the policy engine which model tier to use for each step
 - Routes every LLM call through the gateway (PII enforcement is mandatory, not optional)
 - Exposes runtime metrics
 
 ### policy-engine `:8080`
-- Evaluates each step against remaining budget, step type, and latency SLA
+- Evaluates each step against the remaining budget, step type, and latency SLA
 - Returns an explicit decision: allowed tier, hard stop flag, and a reason string
 - Enables graceful degradation (e.g. downgrade to `cheap`, route to summarize on hard stop)
 
@@ -74,6 +72,13 @@ The system consists of **three services:**
 - Forwards cleaned requests to the upstream LLM (DeepSeek by default)
 - Appends a structured JSON audit log entry for every request (blocked or forwarded)
 - Also usable as a standalone OpenAI-compatible proxy
+
+### mcp-server `:8083`
+- Provides web search capability to agents via the Brave Search API
+- Optional — agents degrade gracefully if no `BRAVE_SEARCH_API_KEY` is set
+
+### dashboard `:3000`
+- Web UI for submitting agent runs and viewing results and metrics
 
 ## Features
 
@@ -87,7 +92,104 @@ The system consists of **three services:**
 - Structured audit log (JSONL) with PII detection results per request
 - Configurable step graph — define arbitrary agent workflows per request
 
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Docker and Docker Compose
+- A DeepSeek API key (or any OpenAI-compatible API key)
+- _(local dev only)_ Go 1.21+
+
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/nazim117/Cost-aware-AI-Agent-execution-engine.git
+cd Cost-aware-AI-Agent-execution-engine
+```
+
+### 2. Set up your environment file
+
+Create a `.env` file at the repo root. Docker Compose reads it automatically — no export needed.
+
+```bash
+cp .env.example .env
+```
+
+Then open `.env` and fill in your keys. At minimum:
+
+```bash
+# Required — the LLM the gateway forwards requests to
+DEEPSEEK_API_KEY=your_deepseek_key_here
+
+# Optional — enables web search in agent steps
+# Leave blank to run without search capability
+BRAVE_SEARCH_API_KEY=
+```
+
+All other values have working defaults. See [Environment Variables](#environment-variables) for the full list.
+
+### 3. Start with Docker Compose
+
+```bash
+docker compose up --build
+```
+
+This builds and starts all five services. The first build takes a minute or two — subsequent starts are much faster.
+
+To run in the background:
+
+```bash
+docker compose up --build -d
+```
+
+### 4. Verify the services are up
+
+```bash
+curl http://localhost:8081/health   # agent-executor
+curl http://localhost:8080/health   # policy-engine
+curl http://localhost:8082/health   # gateway
+```
+
+Each should return:
+
+```json
+{"status": "healthy"}
+```
+
+The dashboard is available at **http://localhost:3000**.
+
+### 5. Run your first agent job
+
+```bash
+curl -X POST http://localhost:8081/agent/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "goal": "Analyze customer churn for the EMEA region",
+    "budget": 0.10,
+    "priority": "normal",
+    "latency_sla_ms": 300
+  }'
+```
+
+### 6. Check metrics
+
+```bash
+curl http://localhost:8081/metrics
+```
+
+### 7. Stop the services
+
+```bash
+docker compose down
+```
+
+---
+
 ## Environment Variables
+
+Place these in a `.env` file at the repo root. Docker Compose picks it up automatically.
 
 | Service | Variable | Default | Description |
 |---|---|---|---|
@@ -96,39 +198,39 @@ The system consists of **three services:**
 | gateway | `AUDIT_LOG_PATH` | `audit.jsonl` | Path to the JSONL audit log file |
 | gateway | `PORT` | `8082` | Listening port |
 | agent-executor | `DEEPSEEK_API_KEY` | — | Used by the local PII scanner fallback when no gateway is reachable |
-| agent-executor | `GATEWAY_URL` | `http://localhost:8082` | Gateway base URL |
-| agent-executor | `POLICY_ENGINE_URL` | `http://localhost:8080` | Policy engine base URL |
+| agent-executor | `GATEWAY_URL` | `http://gateway:8082` | Gateway base URL (set automatically in Docker Compose) |
+| agent-executor | `POLICY_ENGINE_URL` | `http://policy-engine:8080` | Policy engine base URL (set automatically in Docker Compose) |
+| agent-executor | `MCP_SERVER_URL` | `http://mcp-server:8083` | MCP server base URL (set automatically in Docker Compose) |
 | agent-executor | `PORT` | `8081` | Listening port |
+| mcp-server | `BRAVE_SEARCH_API_KEY` | — | Optional. Enables web search. Leave blank to disable. |
+| mcp-server | `PORT` | `8083` | Listening port |
 | policy-engine | `PORT` | `8080` | Listening port |
 
-## Quick Start
-
-### Prerequisites
-
-- Go 1.21+
-- A DeepSeek API key (or any OpenAI-compatible API key)
-
-### Docker Compose
+**Minimal `.env` to get started (no web search):**
 
 ```bash
-export DEEPSEEK_API_KEY=your_key_here
-docker compose up --build
+DEEPSEEK_API_KEY=your_deepseek_key_here
 ```
 
-Services:
-- `agent-executor` → http://localhost:8081
-- `policy-engine`  → http://localhost:8080
-- `gateway`        → http://localhost:8082
-
-To enable PII blocking (reject instead of redact):
+**With web search enabled:**
 
 ```bash
-DEEPSEEK_API_KEY=your_key BLOCK_ON_PII=true docker compose up --build
+DEEPSEEK_API_KEY=your_deepseek_key_here
+BRAVE_SEARCH_API_KEY=your_brave_key_here
 ```
 
-### Local Development
+**With PII blocking enabled (reject instead of redact):**
 
-Start all three services. The gateway must be up before the agent-executor receives requests.
+```bash
+DEEPSEEK_API_KEY=your_deepseek_key_here
+BLOCK_ON_PII=true
+```
+
+---
+
+## Local Development (without Docker)
+
+Start each service in a separate terminal. Start them in this order — `agent-executor` depends on the others being ready.
 
 ```bash
 # Terminal 1 — policy engine
@@ -143,12 +245,36 @@ DEEPSEEK_API_KEY=your_key go run ./cmd/server
 ```
 
 ```bash
-# Terminal 3 — agent-executor
-cd services/agent-executor
-DEEPSEEK_API_KEY=your_key go run ./cmd/server
+# Terminal 3 — mcp-server
+cd services/mcp-server
+BRAVE_SEARCH_API_KEY=your_key go run ./cmd/server   # key optional
 ```
 
-> Run all commands from their respective service directories. To interact with the API, use the repository root as your working directory for `curl` or client code.
+```bash
+# Terminal 4 — agent-executor
+cd services/agent-executor
+DEEPSEEK_API_KEY=your_key \
+  POLICY_ENGINE_URL=http://localhost:8080 \
+  GATEWAY_URL=http://localhost:8082 \
+  MCP_SERVER_URL=http://localhost:8083 \
+  go run ./cmd/server
+```
+
+> When running locally, service URLs use `localhost`. Docker Compose sets these automatically using container hostnames — you don't need to set them manually there.
+
+### Running Tests
+
+```bash
+# Policy engine
+cd services/policy-engine
+go test ./...
+
+# Agent executor
+cd services/agent-executor
+go test ./...
+```
+
+---
 
 ## API Reference
 
@@ -285,6 +411,8 @@ Returns runtime counters for the agent-executor.
 }
 ```
 
+> Metrics are in-memory and reset on service restart.
+
 ---
 
 ### POST /v1/chat/completions (gateway)
@@ -326,7 +454,7 @@ HTTP 403 Forbidden
 
 ### GET /health
 
-Available on all three services. Returns `{"status": "healthy"}`.
+Available on all three backend services (`agent-executor`, `policy-engine`, `gateway`). Returns `{"status": "healthy"}`.
 
 ---
 
@@ -454,13 +582,51 @@ services/
 │       ├── logger/          # Structured audit log (JSONL)
 │       └── scanner/         # PII regex patterns (canonical, single source of truth)
 │
-└── policy-engine/           # Budget and latency policy evaluation
-    ├── cmd/server/          # HTTP server entry point
-    └── internal/
-        ├── handlers/        # HTTP handlers
-        ├── policy/          # Evaluator
-        └── types/           # Policy context types
+├── mcp-server/              # Web search tool via Brave Search API
+│   └── cmd/server/          # HTTP server entry point
+│
+├── policy-engine/           # Budget and latency policy evaluation
+│   ├── cmd/server/          # HTTP server entry point
+│   └── internal/
+│       ├── handlers/        # HTTP handlers
+│       ├── policy/          # Evaluator
+│       └── types/           # Policy context types
+│
+└── _docker/
+    └── go-service.Dockerfile  # Shared Dockerfile for all Go services
+
+dashboard/                   # Web UI (port 3000)
 ```
+
+---
+
+## Troubleshooting
+
+**Services won't start:**
+```bash
+docker compose logs agent-executor
+docker compose logs policy-engine
+docker compose logs gateway
+docker compose logs mcp-server
+```
+
+**`DEEPSEEK_API_KEY` missing error:**
+Make sure `.env` exists at the repo root (not inside a service subdirectory) and contains `DEEPSEEK_API_KEY=your_key_here`. Docker Compose reads the root `.env` automatically.
+
+**`agent-executor` starts but can't reach `gateway` or `policy-engine`:**
+This can happen if the dependent services haven't finished starting yet. Docker Compose waits for them to start (not to be healthy) by default. Wait a few seconds and retry, or add healthchecks to your `docker-compose.yml` — see the `depends_on` / `condition: service_healthy` pattern in the Docker Compose docs.
+
+**Web search not working in agent steps:**
+`mcp-server` starts without a `BRAVE_SEARCH_API_KEY` but search calls will fail silently. Add `BRAVE_SEARCH_API_KEY=your_key` to your `.env` to enable it.
+
+**Policy engine returns `latency_sla_unachievable`:**
+Your `latency_sla_ms` is too low for any available model tier. The minimum is 80ms (for `cheap`). Raise the SLA value or accept that the step will be skipped.
+
+**All steps use `cheap` / budget exhausted immediately:**
+Check that your `budget` value is large enough. Three steps at minimum cost is `3 × $0.005 = $0.015`. A budget below `$0.016` will be exhausted before `execute` completes.
+
+**Metrics show zero after restart:**
+Expected — metrics are in-memory and reset on restart. This is a known limitation.
 
 ---
 
@@ -468,7 +634,6 @@ services/
 
 - Manage prompts or memory
 - Replace agent frameworks (LangChain, CrewAI, etc.)
-- Provide a UI or dashboard
 - Persist agent state between runs
 
 > This is intentional — it stays focused on infrastructure concerns: cost, latency, and data safety.
