@@ -119,6 +119,32 @@ func ResearchGraph() types.StepGraph {
 	}
 }
 
+// BuildLinearGraph constructs a simple linear StepGraph from an ordered slice of step names.
+// Each step has a single Always edge to the next; the last step is terminal.
+// Returns DefaultGraph() if steps is empty.
+func BuildLinearGraph(steps []string) types.StepGraph {
+	if len(steps) == 0 {
+		return DefaultGraph()
+	}
+	nodes := make(map[string]types.StepNode, len(steps))
+	for i, name := range steps {
+		var edges []types.Edge
+		if i < len(steps)-1 {
+			edges = []types.Edge{
+				{To: steps[i+1], Condition: types.Condition{Always: true}},
+			}
+		}
+		nodes[name] = types.StepNode{
+			Name:  name,
+			Edges: edges,
+		}
+	}
+	return types.StepGraph{
+		Entry: steps[0],
+		Nodes: nodes,
+	}
+}
+
 // CodeReviewGraph returns a step graph suited for code review tasks:
 //
 //	plan → read_code → analyse → draft_review → summarize

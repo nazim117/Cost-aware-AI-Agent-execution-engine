@@ -28,6 +28,16 @@ type PolicyContext struct {
 }
 
 func Evaluate(ctx PolicyContext) Decision {
+	// Guard: zero total budget is always a hard stop.
+	if ctx.Budget.Total <= 0 {
+		return Decision{
+			Allowed:           false,
+			SelectedModelTier: "",
+			HardStop:          true,
+			Reason:            "budget_exhausted",
+		}
+	}
+
 	remainingRatio := ctx.Budget.Remaining / ctx.Budget.Total
 
 	// --- HARD STOP: budget exhaustion ---
@@ -90,6 +100,34 @@ func Evaluate(ctx PolicyContext) Decision {
 				HardStop:          false,
 				Reason:            "execution_cheap_sla_constrained",
 			}
+		}
+
+	case "search":
+		// Search defaults to standard; falls back to cheap on tight budget or SLA
+		if ctx.Request.LatencySLAMs >= 200 && remainingRatio >= 0.30 {
+			return Decision{
+				Allowed:           true,
+				SelectedModelTier: "standard",
+				HardStop:          false,
+				Reason:            "search_standard",
+			}
+		}
+		if ctx.Request.LatencySLAMs >= 80 && remainingRatio >= 0.15 {
+			return Decision{
+				Allowed:           true,
+				SelectedModelTier: "cheap",
+				HardStop:          false,
+				Reason:            "search_cheap_sla_constrained",
+			}
+		}
+
+	case "validate":
+		// Validation is lightweight — always use cheap tier
+		return Decision{
+			Allowed:           true,
+			SelectedModelTier: "cheap",
+			HardStop:          false,
+			Reason:            "validate_cheap",
 		}
 	}
 

@@ -53,7 +53,7 @@ func (c *Client) Evaluate(req PolicyRequest) (*PolicyResponse, error) {
 
 	httpReq, err := http.NewRequest(
 		http.MethodPost,
-		c.baseURL+"/policy/evaluate",
+		c.baseURL+"/policy/check",
 		bytes.NewReader(body),
 	)
 	if err != nil {

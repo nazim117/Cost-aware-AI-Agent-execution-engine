@@ -9,6 +9,7 @@ import (
 
 	"agent-executor/internal/handlers"
 	"agent-executor/internal/metrics"
+	"agent-executor/internal/runs"
 )
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -43,9 +44,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	m := metrics.New()
+	rb := runs.NewBuffer()
 
-	mux.HandleFunc("/agent/run", handlers.RunAgentHandler(m))
+	mux.HandleFunc("/agent/run", handlers.RunAgentHandler(m, rb))
 	mux.HandleFunc("/metrics", handlers.MetricsHandler(m))
+	mux.HandleFunc("/runs", handlers.RunsHandler(rb))
+	mux.HandleFunc("/runs/", handlers.RunHandler(rb))
 	mux.HandleFunc("/health", handleHealth)
 
 	// ReadTimeout covers reading the request body.

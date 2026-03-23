@@ -444,6 +444,166 @@ function StepGraph({ graph, steps = [], running = false }) {
   );
 }
 
+// ─── Cost Trend Chart ─────────────────────────────────────────────────────
+
+function CostTrendChart({ runs }) {
+  const MAX_POINTS = 20;
+  const points = [...runs].reverse().slice(0, MAX_POINTS); // oldest → newest
+  if (points.length < 2) {
+    return (
+      <div style={{ fontSize: "10px", color: "#484f58", fontFamily: "'JetBrains Mono', monospace", padding: "8px 0" }}>
+        run more agents to see trend
+      </div>
+    );
+  }
+
+  const W = 220, H = 56, PAD = 6;
+  const costs = points.map(r => r.total_cost);
+  const minC = Math.min(...costs);
+  const maxC = Math.max(...costs);
+  const range = maxC - minC || 0.001;
+
+  const toX = i => PAD + (i / (points.length - 1)) * (W - PAD * 2);
+  const toY = c => PAD + (1 - (c - minC) / range) * (H - PAD * 2);
+
+  const polyPoints = points.map((r, i) => `${toX(i)},${toY(r.total_cost)}`).join(" ");
+
+  return (
+    <svg width={W} height={H} style={{ display: "block", overflow: "visible" }}>
+      <polyline points={polyPoints} fill="none" stroke="#22c55e" strokeWidth="1.5" />
+      {points.map((r, i) => (
+        <circle key={i} cx={toX(i)} cy={toY(r.total_cost)} r="2.5" fill="#22c55e" opacity="0.8" />
+      ))}
+      <text x={PAD} y={H - 1} fontSize="8" fill="#484f58" fontFamily="'JetBrains Mono', monospace">
+        ${minC.toFixed(3)}
+      </text>
+      <text x={W - PAD} y={H - 1} fontSize="8" fill="#484f58" fontFamily="'JetBrains Mono', monospace" textAnchor="end">
+        ${maxC.toFixed(3)}
+      </text>
+    </svg>
+  );
+}
+
+// ─── Run History Panel ─────────────────────────────────────────────────────
+
+function RunHistoryPanel({ runs, onClose }) {
+  const [selectedRun, setSelectedRun] = useState(null);
+
+  return (
+    <div style={{
+      width: "300px", minWidth: "300px",
+      background: "#161b22", borderLeft: "1px solid #21262d",
+      display: "flex", flexDirection: "column", overflow: "hidden",
+    }}>
+      {/* Panel header */}
+      <div style={{
+        padding: "12px 16px", borderBottom: "1px solid #21262d",
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        flexShrink: 0,
+      }}>
+        <span style={{ fontSize: "11px", fontWeight: 700, color: "#e6edf3", letterSpacing: "0.06em" }}>RUN HISTORY</span>
+        <button onClick={onClose} style={{
+          background: "none", border: "none", cursor: "pointer",
+          color: "#6e7681", fontSize: "14px", padding: "2px 4px",
+        }}>✕</button>
+      </div>
+
+      {/* Cost trend chart */}
+      {runs.length > 1 && (
+        <div style={{ padding: "10px 16px", borderBottom: "1px solid #21262d", flexShrink: 0 }}>
+          <div style={{ fontSize: "9px", color: "#6e7681", letterSpacing: "0.1em", marginBottom: "6px" }}>COST TREND</div>
+          <CostTrendChart runs={runs} />
+        </div>
+      )}
+
+      {/* Run detail */}
+      {selectedRun ? (
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px" }}>
+          <button onClick={() => setSelectedRun(null)} style={{
+            background: "none", border: "none", cursor: "pointer",
+            color: "#58a6ff", fontSize: "10px", padding: 0, marginBottom: "10px",
+            fontFamily: "'JetBrains Mono', monospace",
+          }}>← back</button>
+          <div style={{ fontSize: "11px", color: "#e6edf3", marginBottom: "6px", wordBreak: "break-word" }}>
+            {selectedRun.goal}
+          </div>
+          <div style={{ fontSize: "10px", color: "#6e7681", marginBottom: "10px", display: "flex", gap: "10px" }}>
+            <span style={{ color: "#22c55e" }}>${selectedRun.total_cost?.toFixed(4)}</span>
+            <span>{selectedRun.total_latency_ms}ms</span>
+            <span>{selectedRun.timestamp?.slice(11, 19)}</span>
+          </div>
+
+          {/* Step table */}
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "10px", fontFamily: "'JetBrains Mono', monospace" }}>
+            <thead>
+              <tr>
+                {["Step", "Tier", "Cost", "Latency", "Reason"].map(h => (
+                  <th key={h} style={{
+                    textAlign: "left", color: "#6e7681", fontWeight: 600,
+                    padding: "4px 6px 6px", borderBottom: "1px solid #21262d",
+                    letterSpacing: "0.06em", fontSize: "9px",
+                  }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {(selectedRun.steps || []).map((s, i) => {
+                const meta = TIER_META[s.model_tier] || TIER_META.stopped;
+                return (
+                  <tr key={i} style={{ borderBottom: "1px solid #21262d30" }}>
+                    <td style={{ padding: "5px 6px", color: "#8b949e" }}>{s.step}</td>
+                    <td style={{ padding: "5px 6px" }}>
+                      <span style={{ color: meta.color, fontSize: "9px", fontWeight: 600 }}>{meta.label}</span>
+                    </td>
+                    <td style={{ padding: "5px 6px", color: "#22c55e" }}>${s.cost?.toFixed(3)}</td>
+                    <td style={{ padding: "5px 6px", color: "#3b82f6" }}>{s.latency_ms}ms</td>
+                    <td style={{ padding: "5px 6px", color: "#484f58", maxWidth: "80px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                      title={s.decision}>{s.decision}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        /* Run list */
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {runs.length === 0 ? (
+            <div style={{ padding: "20px 16px", fontSize: "11px", color: "#484f58", fontFamily: "'JetBrains Mono', monospace" }}>
+              no runs yet
+            </div>
+          ) : (
+            runs.map(run => (
+              <button key={run.run_id} onClick={() => setSelectedRun(run)} style={{
+                width: "100%", background: "none", border: "none",
+                borderBottom: "1px solid #21262d", padding: "10px 14px",
+                cursor: "pointer", textAlign: "left",
+                transition: "background 0.1s",
+              }}
+                onMouseEnter={e => e.currentTarget.style.background = "#21262d"}
+                onMouseLeave={e => e.currentTarget.style.background = "none"}
+              >
+                <div style={{
+                  fontSize: "11px", color: "#c9d1d9", marginBottom: "4px",
+                  fontFamily: "'JetBrains Mono', monospace",
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                }}>
+                  {run.goal?.length > 55 ? run.goal.slice(0, 55) + "…" : run.goal}
+                </div>
+                <div style={{ display: "flex", gap: "10px", fontSize: "10px", fontFamily: "'JetBrains Mono', monospace" }}>
+                  <span style={{ color: "#22c55e" }}>${run.total_cost?.toFixed(4)}</span>
+                  <span style={{ color: "#484f58" }}>{run.timestamp?.slice(11, 19)}</span>
+                  <span style={{ color: "#6e7681" }}>{run.steps?.length ?? 0} steps</span>
+                </div>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Message Bubble ───────────────────────────────────────────────────────
 
 function Message({ msg }) {
@@ -531,13 +691,26 @@ export default function App() {
   const [currentStepIdx, setCurrentStepIdx] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [totalMetrics, setTotalMetrics] = useState({ runs: 0, cost: 0, steps: 0 });
+  const [runs, setRuns] = useState([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
 
+  const fetchRuns = async () => {
+    try {
+      const res = await fetch("/runs");
+      if (res.ok) setRuns(await res.json());
+    } catch (_) { /* ignore — backend may not be running */ }
+  };
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    fetchRuns();
+  }, []);
 
   const handleSend = async () => {
     if (!input.trim() || running) return;
@@ -620,6 +793,7 @@ export default function App() {
     } finally {
       setRunning(false);
       setCurrentStepIdx(0);
+      fetchRuns();
     }
   };
 
@@ -770,6 +944,7 @@ export default function App() {
       </div>
 
       {/* ── Main chat area ── */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "row", minWidth: 0 }}>
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
 
         {/* Header */}
@@ -801,6 +976,17 @@ export default function App() {
                 <span style={{ fontSize: "10px", color: "#6e7681" }}>{name}</span>
               </div>
             ))}
+            <button onClick={() => setHistoryOpen(v => !v)} style={{
+              background: historyOpen ? "#21262d" : "none",
+              border: `1px solid ${historyOpen ? "#58a6ff40" : "#30363d"}`,
+              borderRadius: "6px", cursor: "pointer",
+              color: historyOpen ? "#58a6ff" : "#6e7681",
+              fontSize: "10px", padding: "4px 10px",
+              fontFamily: "'JetBrains Mono', monospace",
+              transition: "all 0.15s",
+            }}>
+              history {runs.length > 0 && <span style={{ color: "#22c55e" }}>{runs.length}</span>}
+            </button>
           </div>
         </div>
 
@@ -882,7 +1068,13 @@ export default function App() {
             cost-aware AI agent engine · policy engine routes each step to optimal model tier
           </div>
         </div>
-      </div>
+      </div>{/* end flex column */}
+
+      {/* ── Run History Panel ── */}
+      {historyOpen && (
+        <RunHistoryPanel runs={runs} onClose={() => setHistoryOpen(false)} />
+      )}
+      </div>{/* end flex row */}
 
       <style>{`
         @keyframes pulse       { 0%,100%{opacity:1} 50%{opacity:0.4} }

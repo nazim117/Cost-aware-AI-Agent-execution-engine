@@ -56,6 +56,7 @@ type AgentRunRequest struct {
 }
 
 type AgentRunResponse struct {
+	RunID          string         `json:"run_id"`
 	Result         string         `json:"result"`
 	TotalCost      float64        `json:"total_cost"`
 	TotalLatencyMs int64          `json:"total_latency_ms"`

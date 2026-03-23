@@ -12,6 +12,7 @@ export default defineConfig({
       },
       '/agent': 'http://localhost:8081',
       '/metrics': 'http://localhost:8081',
+      '/runs': 'http://localhost:8081',
     }
   }
 })
