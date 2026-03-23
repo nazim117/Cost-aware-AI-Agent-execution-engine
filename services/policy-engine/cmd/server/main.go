@@ -36,7 +36,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/policy/evaluate", handlers.EvaluatePolicyHandler)
+	mux.HandleFunc("/policy/check", handlers.EvaluatePolicyHandler)     // used by agent-executor
+	mux.HandleFunc("/policy/evaluate", handlers.PublicEvaluateHandler) // standalone public API
 	mux.HandleFunc("/health", handleHealth)
 
 	server := &http.Server{

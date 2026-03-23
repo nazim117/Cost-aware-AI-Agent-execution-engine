@@ -44,11 +44,143 @@ func baselineTierForStep(stepType string) string {
 		return "premium"
 	case "execute":
 		return "standard"
+	case "search":
+		return "standard"
+	case "validate":
+		return "cheap"
 	case "summarize":
 		return "cheap"
 	default:
 		return "standard"
 	}
+}
+
+// validDynamicSteps is the set of step names the LLM is allowed to return during planning.
+var validDynamicSteps = map[string]bool{
+	"execute":  true,
+	"search":   true,
+	"validate": true,
+	"summarize": true,
+}
+
+// normalizePlanSteps parses the raw LLM output as a JSON array of step names,
+// filters to valid names, deduplicates, and ensures "summarize" is the final step.
+// Falls back to ["execute", "summarize"] on any parse or validation error.
+func normalizePlanSteps(rawJSON string) []string {
+	// Tolerate LLM padding around the JSON array.
+	start := strings.Index(rawJSON, "[")
+	end := strings.LastIndex(rawJSON, "]")
+	if start != -1 && end > start {
+		rawJSON = rawJSON[start : end+1]
+	}
+
+	var parsed []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(rawJSON)), &parsed); err != nil {
+		log.Printf("[runner] dynamic planning: invalid JSON from LLM (%v), falling back to [execute, summarize]", err)
+		return []string{"execute", "summarize"}
+	}
+
+	seen := map[string]bool{}
+	var steps []string
+	for _, s := range parsed {
+		s = strings.TrimSpace(strings.ToLower(s))
+		if validDynamicSteps[s] && s != "summarize" && !seen[s] {
+			seen[s] = true
+			steps = append(steps, s)
+		}
+	}
+
+	if len(steps) == 0 {
+		log.Printf("[runner] dynamic planning: no valid steps after filtering, falling back to [execute, summarize]")
+		return []string{"execute", "summarize"}
+	}
+
+	steps = append(steps, "summarize")
+	return steps
+}
+
+// performDynamicPlanning calls the policy engine and LLM to produce a dynamic step list.
+// The plan step itself is evaluated by the policy engine and recorded in the trace.
+// On hard stop or parse failure it falls back to ["execute", "summarize"].
+func performDynamicPlanning(
+	req types.AgentRunRequest,
+	policy *policyclient.Client,
+	m *metrics.Metrics,
+	remainingBudget *float64,
+	totalCost *float64,
+) ([]string, types.AgentStepRun, error) {
+	policyReq := policyclient.PolicyRequest{}
+	policyReq.Step.Name = "plan"
+	policyReq.Budget.Total = req.Budget
+	policyReq.Budget.Remaining = *remainingBudget
+	policyReq.Request.LatencySLAMs = req.LatencySLAMs
+
+	decision, err := policy.Evaluate(policyReq)
+	if err != nil {
+		return nil, types.AgentStepRun{}, err
+	}
+
+	if decision.Decision.HardStop {
+		m.IncHardStop()
+		planTrace := types.AgentStepRun{
+			Step:      "plan",
+			ModelTier: "",
+			Cost:      0,
+			LatencyMs: 0,
+			Decision:  decision.Reason,
+			Content:   "",
+		}
+		return []string{"execute", "summarize"}, planTrace, nil
+	}
+
+	tier := decision.Decision.SelectedModelTier
+	if costByTier[tier] > *remainingBudget {
+		tier = "cheap"
+	}
+	baseline := baselineTierForStep("plan")
+	if tier != baseline {
+		m.IncDowngrade(decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "sla") {
+		m.IncSLAPrevented()
+	}
+
+	latency := latencyByTier[tier]
+	startTime := time.Now()
+
+	content, toolCalls, err := callLLMWithPIIScanning(req.Goal, "plan_steps", tier, "plan", "")
+	if err != nil {
+		return nil, types.AgentStepRun{}, err
+	}
+
+	actualLatency := time.Since(startTime)
+	if actualLatency < latency {
+		time.Sleep(latency - actualLatency)
+	}
+	recordedLatency := time.Since(startTime)
+
+	cost := costByTier[tier]
+	*remainingBudget -= cost
+	*totalCost += cost
+	m.AddCost(cost)
+	m.IncStep("plan", tier)
+	baselineCost := costByTier[baseline]
+	if baselineCost > cost {
+		m.AddCostSaved(baselineCost - cost)
+	}
+
+	planTrace := types.AgentStepRun{
+		Step:      "plan",
+		ModelTier: tier,
+		Cost:      cost,
+		LatencyMs: recordedLatency.Milliseconds(),
+		Decision:  decision.Reason,
+		Content:   content,
+		ToolCalls: toolCalls,
+	}
+
+	steps := normalizePlanSteps(content)
+	return steps, planTrace, nil
 }
 
 // RunAgent executes an agent run by traversing the step graph.
@@ -65,17 +197,27 @@ func RunAgent(
 	m.IncAgentRun()
 	start := time.Now()
 
-	// Resolve the step graph — use caller-supplied graph or fall back to default.
-	graph := DefaultGraph()
-	if req.StepGraph != nil {
-		graph = *req.StepGraph
-	}
-
 	remainingBudget := req.Budget
 	var totalCost float64
 	var trace []types.AgentStepRun
 	var result string
 	var accumulatedContext string
+
+	// Resolve the step graph.
+	// When the caller provides a StepGraph, use it as-is.
+	// Otherwise, run the dynamic planning step: ask the LLM to choose the steps,
+	// then build a linear graph from the response.
+	var graph types.StepGraph
+	if req.StepGraph != nil {
+		graph = *req.StepGraph
+	} else {
+		steps, planTrace, err := performDynamicPlanning(req, policy, m, &remainingBudget, &totalCost)
+		if err != nil {
+			return nil, err
+		}
+		trace = append(trace, planTrace)
+		graph = BuildLinearGraph(steps)
+	}
 
 	// Traverse the graph starting at the entry node.
 	currentName := graph.Entry
@@ -434,6 +576,8 @@ func callLLMWithPIIScanning(goal, stepType, tier, stepName, priorContext string)
 
 func getSystemPromptForStep(stepType string) string {
 	switch stepType {
+	case "plan_steps":
+		return `You are a planning agent. Given a goal, return ONLY a valid JSON array of step names. Available steps: execute, search, validate, summarize. The last step must be "summarize". No markdown, no explanation. JSON array only. Example: ["search","execute","summarize"]`
 	case "plan":
 		return "You are a planning agent. You MUST use the available tools to gather real information — never answer from memory. For weather: call http_request with url=https://wttr.in/{city}?format=j1. Replace {city} with the actual city name using + for spaces (e.g. New+York)."
 	case "execute":
