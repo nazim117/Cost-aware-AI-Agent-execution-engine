@@ -35,6 +35,19 @@ services/agent-executor/.env
 # Windows NUL device artifact
 nul
 
+# Secrets
+# Ignore configuration files that contain secrets
+config/secrets.yml
+# Ignore any files that may contain API keys
+*.key
+# Ignore JSON files that may contain sensitive data
+*.json
+# Other common sensitive files
+*.pem
+*.crt
+# Ignore other common patterns
+secrets/
+
 # Editor/IDE
 # .idea/
 # .vscode/
