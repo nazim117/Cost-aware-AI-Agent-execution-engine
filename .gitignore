@@ -52,3 +52,10 @@ secrets/
 # .idea/
 # .vscode/
 .gitnexus
+
+docs/
+
+.claude/
+AGENTS.md
+CLAUDE.md
+PLAN.MD
