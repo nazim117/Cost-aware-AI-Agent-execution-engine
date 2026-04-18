@@ -10,6 +10,11 @@
 #
 # Each integration test creates a throwaway Qdrant collection (deleted in
 # teardown) so tests are fully isolated and leave no state behind.
+#
+# Step 5 note:
+#   ingest() and retrieve() now require a project_id.  Integration tests use
+#   placeholder ids ("proj-alpha" / "proj-beta") to verify that filtering
+#   by project_id actually isolates one project's chunks from another's.
 
 from pathlib import Path
 from uuid import uuid4
@@ -97,7 +102,7 @@ async def test_ingest_returns_correct_chunk_count(col, monkeypatch):
     monkeypatch.setattr(cfg.settings, "qdrant_docs_collection", col_name)
 
     text = "x" * 1000   # 1000 chars → chunk_text(size=500, overlap=50) → 3 chunks
-    count = await ingest("test-source", text, vs)
+    count = await ingest("proj-alpha", "test-source", text, vs)
     assert count == 3
 
 
@@ -110,12 +115,12 @@ async def test_retrieve_finds_relevant_chunk(col, monkeypatch):
     monkeypatch.setattr(cfg.settings, "qdrant_docs_collection", col_name)
 
     fixture_text = (FIXTURES_DIR / "sample.md").read_text(encoding="utf-8")
-    await ingest("sample.md", fixture_text, vs)
+    await ingest("proj-alpha", "sample.md", fixture_text, vs)
 
     # Query with a phrase only present in the fixture — "Bluebell DB" and
     # "write-ahead log" are specific enough that the top hit should be the
     # WAL-related chunk.
-    chunks = await retrieve("write-ahead log durability", k=3, vstore=vs)
+    chunks = await retrieve("proj-alpha", "write-ahead log durability", k=3, vstore=vs)
 
     assert len(chunks) > 0
     assert chunks[0].source == "sample.md"
@@ -134,21 +139,23 @@ async def test_retrieve_ranks_relevant_above_irrelevant(col, monkeypatch):
     import config as cfg
     monkeypatch.setattr(cfg.settings, "qdrant_docs_collection", col_name)
 
-    # Two completely different topics.
+    # Two completely different topics, same project.
     await ingest(
+        "proj-alpha",
         "databases.txt",
         "Bluebell DB uses a write-ahead log for durability and bloom filters "
         "for fast key lookups on disk.",
         vs,
     )
     await ingest(
+        "proj-alpha",
         "cooking.txt",
         "To make a perfect omelette, whisk three eggs with salt and cook on "
         "medium heat. Fold gently before serving.",
         vs,
     )
 
-    chunks = await retrieve("write-ahead log database storage", k=2, vstore=vs)
+    chunks = await retrieve("proj-alpha", "write-ahead log database storage", k=2, vstore=vs)
 
     # The database chunk should be the top hit.
     assert chunks[0].source == "databases.txt"
@@ -164,11 +171,41 @@ async def test_ingest_stores_source_and_chunk_index(col, monkeypatch):
     monkeypatch.setattr(cfg.settings, "qdrant_docs_collection", col_name)
 
     # Short text → one chunk (chunk_index 0).
-    await ingest("my-file.txt", "hello world this is a test document", vs)
+    await ingest("proj-alpha", "my-file.txt", "hello world this is a test document", vs)
 
-    chunks = await retrieve("hello world", k=1, vstore=vs)
+    chunks = await retrieve("proj-alpha", "hello world", k=1, vstore=vs)
 
     assert len(chunks) == 1
     assert chunks[0].source == "my-file.txt"
     assert chunks[0].chunk_index == 0
     assert "hello" in chunks[0].text
+
+
+@pytest.mark.integration
+async def test_retrieve_isolates_by_project(col, monkeypatch):
+    """Chunks ingested into project A must be invisible to project B.
+
+    This is the whole point of Step 5.  Ingest distinctive text into
+    proj-alpha, then search from proj-beta — we should get zero hits.
+    """
+    vs, col_name = col
+
+    import config as cfg
+    monkeypatch.setattr(cfg.settings, "qdrant_docs_collection", col_name)
+
+    # Something distinctive that only Alpha knows about.
+    await ingest(
+        "proj-alpha",
+        "alpha-secret.txt",
+        "The Alphium reactor operates at 2.7 gigapascals with a titanium vessel.",
+        vs,
+    )
+
+    # Searching as Beta should not find Alpha's chunk.
+    beta_hits = await retrieve("proj-beta", "Alphium reactor titanium", k=5, vstore=vs)
+    assert beta_hits == []
+
+    # But searching as Alpha should find it.
+    alpha_hits = await retrieve("proj-alpha", "Alphium reactor titanium", k=5, vstore=vs)
+    assert len(alpha_hits) > 0
+    assert alpha_hits[0].source == "alpha-secret.txt"

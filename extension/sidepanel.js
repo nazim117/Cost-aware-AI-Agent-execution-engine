@@ -1,10 +1,18 @@
-// sidepanel.js — UI logic for the chat agent side panel.
+// sidepanel.js — UI logic for the Project Brain side panel.
 //
 // This script runs in the side panel's own page context (not in a tab, not in
 // the background worker).  It can use:
-//   - chrome.storage.local  — to persist the session_id
-//   - chrome.runtime.sendMessage — to talk to background.js
-//   - fetch()               — to call the agent server directly
+//   - chrome.storage.local          — to persist the selected project + its session id
+//   - chrome.runtime.sendMessage    — to ask background.js to read the active tab
+//   - fetch()                       — to call the agent server directly
+//
+// Storage shape (chrome.storage.local):
+//   {
+//     currentProjectId: "<uuid>",
+//     sessionByProject: { "<uuid>": "<session-uuid>", ... }
+//   }
+// Each project has its own session id so conversations do not mix even inside
+// the extension's own UI.
 //
 // The agent server URL is hardcoded to the default port.  If you change
 // settings.port in config.py, update AGENT_URL here too.
@@ -12,34 +20,33 @@
 const AGENT_URL = "http://localhost:8084";
 
 // ---------------------------------------------------------------------------
-// Session ID — persisted in chrome.storage.local so the conversation survives
-// browser restarts.  Generated once as a random UUID on first use.
+// Local state — mirrors chrome.storage.local, refreshed on load.
 // ---------------------------------------------------------------------------
-let sessionId = null;
+let projects = [];        // [{id, name, created_at, external_refs}, ...]
+let currentProjectId = null;
+let sessionByProject = {};  // projectId -> sessionId
 
-async function getOrCreateSessionId() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(["sessionId"], (result) => {
-      if (result.sessionId) {
-        resolve(result.sessionId);
-      } else {
-        // crypto.randomUUID() is available in extension contexts (Chrome 92+).
-        const id = crypto.randomUUID();
-        chrome.storage.local.set({ sessionId: id });
-        resolve(id);
-      }
-    });
-  });
+// ---------------------------------------------------------------------------
+// Storage helpers — thin Promise wrappers around the callback-based API
+// ---------------------------------------------------------------------------
+function storageGet(keys) {
+  return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
+}
+function storageSet(values) {
+  return new Promise((resolve) => chrome.storage.local.set(values, resolve));
 }
 
 // ---------------------------------------------------------------------------
-// DOM helpers
+// DOM handles
 // ---------------------------------------------------------------------------
-const transcript = document.getElementById("transcript");
-const statusEl   = document.getElementById("status");
-const inputEl    = document.getElementById("input");
-const sendBtn    = document.getElementById("send-btn");
-const usePageBtn = document.getElementById("use-page-btn");
+const projectSelect   = document.getElementById("project-select");
+const newProjectBtn   = document.getElementById("new-project-btn");
+const deleteProjectBtn = document.getElementById("delete-project-btn");
+const transcript      = document.getElementById("transcript");
+const statusEl        = document.getElementById("status");
+const inputEl         = document.getElementById("input");
+const sendBtn         = document.getElementById("send-btn");
+const usePageBtn      = document.getElementById("use-page-btn");
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -50,14 +57,124 @@ function appendBubble(role, text) {
   div.className = `bubble ${role}`;
   div.textContent = text;
   transcript.appendChild(div);
-  // Scroll to the bottom so the latest message is always visible.
   transcript.scrollTop = transcript.scrollHeight;
 }
 
+function clearTranscript() {
+  transcript.innerHTML = "";
+}
+
 function setBusy(busy) {
-  sendBtn.disabled   = busy;
-  usePageBtn.disabled = busy;
-  inputEl.disabled   = busy;
+  sendBtn.disabled          = busy;
+  usePageBtn.disabled       = busy;
+  inputEl.disabled          = busy;
+  projectSelect.disabled    = busy;
+  newProjectBtn.disabled    = busy;
+  deleteProjectBtn.disabled = busy || !currentProjectId;
+}
+
+// ---------------------------------------------------------------------------
+// Projects — fetch the list from the agent and reflect it in the dropdown
+// ---------------------------------------------------------------------------
+async function loadProjects() {
+  const response = await fetch(`${AGENT_URL}/projects`);
+  if (!response.ok) throw new Error(`GET /projects returned ${response.status}`);
+  projects = await response.json();
+  renderProjectSelect();
+}
+
+function renderProjectSelect() {
+  projectSelect.innerHTML = "";
+  if (projects.length === 0) {
+    const opt = document.createElement("option");
+    opt.textContent = "(no projects — click +)";
+    opt.disabled = true;
+    opt.selected = true;
+    projectSelect.appendChild(opt);
+    deleteProjectBtn.disabled = true;
+    return;
+  }
+  for (const p of projects) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name;
+    if (p.id === currentProjectId) opt.selected = true;
+    projectSelect.appendChild(opt);
+  }
+  deleteProjectBtn.disabled = !currentProjectId;
+}
+
+async function createProject() {
+  const name = prompt("Project name:");
+  if (!name || !name.trim()) return;
+  setBusy(true);
+  setStatus("Creating project…");
+  try {
+    const response = await fetch(`${AGENT_URL}/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    if (!response.ok) throw new Error(`Server returned ${response.status}`);
+    const project = await response.json();
+    projects.unshift(project);  // newest first
+    await selectProject(project.id);
+    setStatus(`✓ Created project "${project.name}"`);
+  } catch (err) {
+    setStatus(`⚠ Create failed: ${err.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteCurrentProject() {
+  if (!currentProjectId) return;
+  const current = projects.find((p) => p.id === currentProjectId);
+  if (!current) return;
+  const ok = confirm(
+    `Delete project "${current.name}" and all of its memory?\n` +
+    `This wipes its conversation history and ingested documents.`
+  );
+  if (!ok) return;
+
+  setBusy(true);
+  setStatus("Deleting…");
+  try {
+    const response = await fetch(`${AGENT_URL}/projects/${currentProjectId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) throw new Error(`Server returned ${response.status}`);
+
+    projects = projects.filter((p) => p.id !== currentProjectId);
+    delete sessionByProject[currentProjectId];
+    await storageSet({ sessionByProject });
+
+    // Fall back to the next project, or nothing.
+    const next = projects[0]?.id ?? null;
+    await selectProject(next);
+    setStatus(`✓ Deleted "${current.name}"`);
+  } catch (err) {
+    setStatus(`⚠ Delete failed: ${err.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function selectProject(projectId) {
+  currentProjectId = projectId;
+  await storageSet({ currentProjectId });
+
+  // Create a session id for this project on first switch.
+  if (projectId && !sessionByProject[projectId]) {
+    sessionByProject[projectId] = crypto.randomUUID();
+    await storageSet({ sessionByProject });
+  }
+
+  renderProjectSelect();
+  clearTranscript();
+  deleteProjectBtn.disabled = !projectId;
+  if (projectId) setStatus("");
+  else setStatus("Create a project to get started.");
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +183,12 @@ function setBusy(busy) {
 async function sendMessage() {
   const message = inputEl.value.trim();
   if (!message) return;
+  if (!currentProjectId) {
+    setStatus("⚠ Create or select a project first.");
+    return;
+  }
+
+  const sessionId = sessionByProject[currentProjectId];
 
   inputEl.value = "";
   appendBubble("user", message);
@@ -76,7 +199,11 @@ async function sendMessage() {
     const response = await fetch(`${AGENT_URL}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, message }),
+      body: JSON.stringify({
+        project_id: currentProjectId,
+        session_id: sessionId,
+        message,
+      }),
     });
 
     if (!response.ok) {
@@ -96,14 +223,17 @@ async function sendMessage() {
 }
 
 // ---------------------------------------------------------------------------
-// Use current page — extract the tab's text, ingest it, confirm to the user
+// Use current page — extract the tab's text, ingest into the current project
 // ---------------------------------------------------------------------------
 async function useCurrentPage() {
+  if (!currentProjectId) {
+    setStatus("⚠ Create or select a project first.");
+    return;
+  }
+
   setBusy(true);
   setStatus("Reading page…");
 
-  // Ask background.js to ask content.js for the page text.
-  // background.js is the only context that can talk to a specific tab.
   let pageData;
   try {
     pageData = await new Promise((resolve, reject) => {
@@ -129,7 +259,11 @@ async function useCurrentPage() {
     const response = await fetch(`${AGENT_URL}/ingest`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source: pageData.url, text: pageData.text }),
+      body: JSON.stringify({
+        project_id: currentProjectId,
+        source: pageData.url,
+        text: pageData.text,
+      }),
     });
 
     if (!response.ok) {
@@ -150,8 +284,6 @@ async function useCurrentPage() {
 // ---------------------------------------------------------------------------
 sendBtn.addEventListener("click", sendMessage);
 
-// Also send on Enter key (Shift+Enter inserts a newline — not applicable here
-// since the input is a single-line <input>, but good habit to document).
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -160,11 +292,37 @@ inputEl.addEventListener("keydown", (e) => {
 });
 
 usePageBtn.addEventListener("click", useCurrentPage);
+newProjectBtn.addEventListener("click", createProject);
+deleteProjectBtn.addEventListener("click", deleteCurrentProject);
+
+projectSelect.addEventListener("change", (e) => {
+  selectProject(e.target.value);
+});
 
 // ---------------------------------------------------------------------------
 // Initialise — run once when the side panel loads
 // ---------------------------------------------------------------------------
 (async () => {
-  sessionId = await getOrCreateSessionId();
-  inputEl.focus();
+  try {
+    const stored = await storageGet(["currentProjectId", "sessionByProject"]);
+    currentProjectId = stored.currentProjectId ?? null;
+    sessionByProject = stored.sessionByProject ?? {};
+
+    await loadProjects();
+
+    // If the stored project no longer exists on the server, clear it.
+    if (currentProjectId && !projects.find((p) => p.id === currentProjectId)) {
+      currentProjectId = null;
+    }
+    // If no project is selected but some exist, pick the first one.
+    if (!currentProjectId && projects.length > 0) {
+      await selectProject(projects[0].id);
+    } else {
+      await selectProject(currentProjectId);
+    }
+
+    inputEl.focus();
+  } catch (err) {
+    setStatus(`⚠ Cannot reach agent at ${AGENT_URL}. Is the server running?`);
+  }
 })();

@@ -79,15 +79,24 @@ def chunk_text(text: str, size: int = 500, overlap: int = 50) -> list[str]:
     return chunks
 
 
-async def ingest(source: str, text: str, vstore: VectorStore) -> int:
-    """Split a document into chunks, embed each one, and store them in Qdrant.
+async def ingest(
+    project_id: str,
+    source: str,
+    text: str,
+    vstore: VectorStore,
+) -> int:
+    """Split a document into chunks, embed each one, and store them in Qdrant
+    tagged with `project_id`.
 
     Args:
-        source: A label for this document — typically a filename or URL.
-                Stored in the Qdrant payload so retrieved chunks can be
-                attributed back to their origin.
-        text:   The full document text.
-        vstore: The VectorStore instance to write into.
+        project_id: The project this document belongs to.  Every resulting
+                    chunk's Qdrant payload is tagged with this id so it only
+                    comes back in searches scoped to the same project.
+        source:     A label for this document — typically a filename or URL.
+                    Stored alongside project_id so retrieved chunks can be
+                    attributed back to their origin.
+        text:       The full document text.
+        vstore:     The VectorStore instance to write into.
 
     Returns:
         The number of chunks stored.  Useful for confirming how much was indexed.
@@ -98,6 +107,7 @@ async def ingest(source: str, text: str, vstore: VectorStore) -> int:
         vector = await embed(chunk)
         await vstore.upsert(
             collection=settings.qdrant_docs_collection,
+            project_id=project_id,
             vector=vector,
             payload={
                 "source": source,
@@ -106,17 +116,31 @@ async def ingest(source: str, text: str, vstore: VectorStore) -> int:
             },
         )
 
-    logger.info("Ingested %d chunks from source %r", len(chunks), source)
+    logger.info(
+        "Ingested %d chunks from source %r into project %r",
+        len(chunks),
+        source,
+        project_id,
+    )
     return len(chunks)
 
 
-async def retrieve(query: str, k: int, vstore: VectorStore) -> list[Chunk]:
-    """Find the k document chunks most semantically similar to a query string.
+async def retrieve(
+    project_id: str,
+    query: str,
+    k: int,
+    vstore: VectorStore,
+) -> list[Chunk]:
+    """Find the k document chunks most semantically similar to `query`,
+    restricted to one project.
 
     Args:
-        query:  The search string — usually the user's current message.
-        k:      How many chunks to return.
-        vstore: The VectorStore instance to search.
+        project_id: Only chunks tagged with this id are considered.  Chunks
+                    from other projects are invisible — the whole point of
+                    Step 5's isolation.
+        query:      The search string — usually the user's current message.
+        k:          How many chunks to return.
+        vstore:     The VectorStore instance to search.
 
     Returns:
         List of Chunk objects ordered by score descending (most relevant first).
@@ -124,12 +148,13 @@ async def retrieve(query: str, k: int, vstore: VectorStore) -> list[Chunk]:
     query_vec = await embed(query)
     hits = await vstore.search(
         collection=settings.qdrant_docs_collection,
+        project_id=project_id,
         vector=query_vec,
         k=k,
     )
 
     # Map VectorStore Hit objects to Chunk objects using the raw payload dict.
-    # The payload fields were set by ingest(): {source, chunk_index, text}.
+    # The payload fields were set by ingest(): {project_id, source, chunk_index, text}.
     return [
         Chunk(
             score=h.score,

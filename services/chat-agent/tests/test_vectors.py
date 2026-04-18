@@ -50,11 +50,12 @@ async def test_upsert_and_search_roundtrip(collection):
 
     await vs.upsert(
         collection=col,
+        project_id="test-project",
         vector=make_vec(1.0),
         payload={"session_id": "s1", "role": "user", "content": "hello"},
     )
 
-    hits = await vs.search(collection=col, vector=make_vec(1.0), k=1)
+    hits = await vs.search(collection=col, project_id="test-project", vector=make_vec(1.0), k=1)
 
     assert len(hits) == 1
     assert hits[0].content == "hello"
@@ -69,11 +70,11 @@ async def test_search_returns_most_similar_first(collection):
     vs, col = collection
 
     # Store two messages with very different vectors.
-    await vs.upsert(col, make_vec(1.0),  {"session_id": "s1", "role": "user", "content": "cats"})
-    await vs.upsert(col, make_vec(-1.0), {"session_id": "s1", "role": "user", "content": "opposite"})
+    await vs.upsert(col, "test-project", make_vec(1.0),  {"session_id": "s1", "role": "user", "content": "cats"})
+    await vs.upsert(col, "test-project", make_vec(-1.0), {"session_id": "s1", "role": "user", "content": "opposite"})
 
     # Query with a vector close to 1.0 — "cats" should rank first.
-    hits = await vs.search(col, make_vec(0.99), k=2)
+    hits = await vs.search(col, "test-project", make_vec(0.99), k=2)
 
     assert hits[0].content == "cats"
     assert hits[0].score > hits[1].score
@@ -85,9 +86,9 @@ async def test_search_returns_at_most_k_results(collection):
     vs, col = collection
 
     for i in range(5):
-        await vs.upsert(col, make_vec(float(i + 1)), {"session_id": "s1", "role": "user", "content": f"msg{i}"})
+        await vs.upsert(col, "test-project", make_vec(float(i + 1)), {"session_id": "s1", "role": "user", "content": f"msg{i}"})
 
-    hits = await vs.search(col, make_vec(1.0), k=3)
+    hits = await vs.search(col, "test-project", make_vec(1.0), k=3)
     assert len(hits) <= 3
 
 
@@ -106,11 +107,12 @@ async def test_hit_fields_are_populated(collection):
 
     await vs.upsert(
         col,
+        "test-project",
         make_vec(1.0),
         {"session_id": "sess-abc", "role": "assistant", "content": "I am the assistant."},
     )
 
-    hits = await vs.search(col, make_vec(1.0), k=1)
+    hits = await vs.search(col, "test-project", make_vec(1.0), k=1)
     h = hits[0]
 
     assert h.session_id == "sess-abc"

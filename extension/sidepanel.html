@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chat Agent</title>
+  <title>Project Brain</title>
   <style>
     * {
       box-sizing: border-box;
@@ -30,6 +30,51 @@
       font-size: 15px;
       letter-spacing: 0.3px;
       flex-shrink: 0;
+    }
+
+    /* ── Project bar ── */
+    #project-bar {
+      display: flex;
+      gap: 6px;
+      padding: 8px 16px;
+      background: #ececf3;
+      border-bottom: 1px solid #d9d9e0;
+      flex-shrink: 0;
+      align-items: center;
+    }
+
+    #project-bar label {
+      font-size: 12px;
+      color: #555;
+      font-weight: 500;
+    }
+
+    #project-select {
+      flex: 1;
+      padding: 5px 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      background: #fff;
+    }
+
+    .icon-btn {
+      padding: 5px 8px;
+      background: #fff;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .icon-btn:hover {
+      background: #f0f0f0;
+    }
+
+    .icon-btn.danger:hover {
+      background: #fee;
+      border-color: #e88;
     }
 
     /* ── Transcript ── */
@@ -144,7 +189,15 @@
   </style>
 </head>
 <body>
-  <header>🤖 Chat Agent</header>
+  <header>🧠 Project Brain</header>
+
+  <!-- Project selector — every chat/ingest call is scoped to the chosen project. -->
+  <div id="project-bar">
+    <label for="project-select">Project:</label>
+    <select id="project-select"></select>
+    <button id="new-project-btn" class="icon-btn" title="New project">＋</button>
+    <button id="delete-project-btn" class="icon-btn danger" title="Delete current project">🗑</button>
+  </div>
 
   <div id="transcript"></div>
 
