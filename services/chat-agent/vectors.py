@@ -46,6 +46,7 @@ from qdrant_client.models import (
     PayloadSchemaType,
     PointStruct,
     VectorParams,
+    FilterSelector,
 )
 
 from config import settings
@@ -249,6 +250,45 @@ class VectorStore:
             raise HTTPException(
                 status_code=502,
                 detail=f"Qdrant delete_by_project failed: {exc}",
+            ) from exc
+
+    async def delete_by_source(
+        self, collection: str, project_id: str, source: str
+    ) -> None:
+        """Remove all points for a specific source document within one project.
+
+        Called by sync.py before re-ingesting a PM item so that re-syncing
+        the same ticket doesn't stack duplicate vectors.  Also handles the
+        "ticket was edited and now has fewer chunks" case — old trailing
+        chunks disappear cleanly because we delete-then-rewrite, not append.
+
+        Args:
+            collection: Usually settings.qdrant_docs_collection ("documents").
+            project_id: Restrict deletion to this project's points only.
+            source:     The source label used at ingest time (e.g. "jira:KAN-1").
+        """
+        try:
+            await self._client.delete(
+                collection_name=collection,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key=PROJECT_ID_KEY,
+                                match=MatchValue(value=project_id),
+                            ),
+                            FieldCondition(
+                                key="source",
+                                match=MatchValue(value=source),
+                            ),
+                        ]
+                    )
+                ),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Qdrant delete_by_source failed: {exc}",
             ) from exc
 
 

@@ -12,6 +12,7 @@
 
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
 
 # This file lives at services/chat-agent/config.py.
 # __file__ is the absolute path to this file, so .parent gives services/chat-agent/
@@ -66,6 +67,19 @@ class Settings(BaseSettings):
     # How many semantically similar past messages to retrieve per request.
     # These are injected into the prompt as extra context for the LLM.
     memory_search_k: int = 5
+
+    # --- Jira Cloud (Step 6, optional) ---
+    # Leave empty if you are not using Jira.  All three must be set for the
+    # Jira integration to be active.
+    # base_url looks like "https://your-org.atlassian.net"
+    jira_base_url: str = "https://student-team-fji9lsbv.atlassian.net/"
+    jira_email: str = "499773@student.fontys.nl"
+    jira_api_token: str = "REDACTED_JIRA_API_TOKEN"
+
+    # --- GitHub (Step 6, optional) ---
+    # A Personal Access Token with repo (private) or public_repo (public) scope.
+    # Leave empty if you are not using GitHub.
+    github_token: str = ""
 
     # Check the repo-root .env first, then a local .env next to this file.
     # pydantic-settings reads them left-to-right; later files override earlier ones.

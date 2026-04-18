@@ -27,12 +27,17 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import httpx
+
 from config import settings
 from embeddings import embed
+from integrations.github import GitHubIntegration
+from integrations.jira import JiraIntegration
 from llm import chat
 from memory import ConversationStore
 from projects import SCHEMA_VERSION, Project, ProjectStore
 import rag
+from sync import SyncStore, sync_project
 from vectors import VectorStore
 
 # Use uvicorn's own logger so our INFO messages appear alongside uvicorn's
@@ -45,10 +50,45 @@ logger = logging.getLogger("uvicorn.error")
 project_store = ProjectStore(settings.sqlite_path)
 store = ConversationStore(settings.sqlite_path)
 vstore = VectorStore(url=settings.qdrant_url)
+sync_store = SyncStore(settings.sqlite_path)
+
+# Build the integrations registry at startup — only include adapters whose
+# required credentials are present in the environment.  Unconfigured adapters
+# are skipped silently; the sync endpoint logs a warning if a project's
+# external_refs reference a key that has no matching integration.
+_integrations: dict = {}
+if settings.jira_base_url and settings.jira_email and settings.jira_api_token:
+    _integrations["jira_project_key"] = JiraIntegration(
+        base_url=settings.jira_base_url,
+        email=settings.jira_email,
+        api_token=settings.jira_api_token,
+    )
+if settings.github_token:
+    _integrations["github_repo"] = GitHubIntegration(token=settings.github_token)
 
 # nomic-embed-text always produces 768-dimensional vectors.
 # This must match the dimension used when the Qdrant collections were created.
 EMBED_DIM = 768
+
+# ---------------------------------------------------------------------------
+# Refusal filter — prevent prior LLM refusals from poisoning later prompts.
+# ---------------------------------------------------------------------------
+_REFUSAL_MARKERS = (
+    "i do not have access",
+    "i don't have access",
+    "i cannot see",
+    "i can't see",
+    "i cannot access",
+    "i can't access",
+    "no access to your",
+    "i'm unable to access",
+    "i am unable to access",
+)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _REFUSAL_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +122,10 @@ async def lifespan(app: FastAPI):
         await store.init()
         await vstore.ensure_collection(settings.qdrant_collection, dim=EMBED_DIM)
         await vstore.ensure_collection(settings.qdrant_docs_collection, dim=EMBED_DIM)
+
+    # SyncStore tables are always safe to create — no schema coupling to the
+    # version wipe above.
+    await sync_store.init()
 
     yield
     # Shutdown: no explicit cleanup needed for either store.
@@ -205,10 +249,13 @@ async def post_projects(req: ProjectCreateRequest) -> ProjectOut:
 
     The returned id is a UUID string — stable, safe to use in URLs/JSON.
     """
-    project = await project_store.create(
-        name=req.name,
-        external_refs=req.external_refs,
-    )
+    try:
+        project = await project_store.create(
+            name=req.name,
+            external_refs=req.external_refs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     logger.info("Created project %r (%s)", project.name, project.id)
     return _project_to_out(project)
 
@@ -226,11 +273,14 @@ async def patch_project(project_id: str, req: ProjectUpdateRequest) -> ProjectOu
 
     Step 6 uses this to attach a Jira project key or GitHub repo to a brain.
     """
-    updated = await project_store.update(
-        project_id,
-        name=req.name,
-        external_refs=req.external_refs,
-    )
+    try:
+        updated = await project_store.update(
+            project_id,
+            name=req.name,
+            external_refs=req.external_refs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if updated is None:
         raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found.")
     return _project_to_out(updated)
@@ -251,6 +301,7 @@ async def delete_project(project_id: str):
     # user can retry.
     await vstore.delete_by_project(settings.qdrant_collection, project_id)
     await vstore.delete_by_project(settings.qdrant_docs_collection, project_id)
+    await sync_store.delete_by_project(project_id)
 
     deleted = await project_store.delete(project_id)
     if not deleted:
@@ -258,6 +309,80 @@ async def delete_project(project_id: str):
 
     logger.info("Deleted project %s and all of its memory.", project_id)
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Routes — PM sync (Step 6)
+# ---------------------------------------------------------------------------
+
+@app.post("/projects/{project_id}/sync")
+async def post_sync(project_id: str):
+    """Fetch items from all configured PM integrations for this project and
+    ingest them into the project's RAG document store.
+
+    Idempotent: items already ingested are overwritten with the same content,
+    so re-running sync does not grow the vector store unboundedly.  The
+    last_synced_at timestamp per external ref means only items updated since
+    the last sync are fetched on subsequent runs (incremental).
+
+    Requires the project to have at least one entry in external_refs whose
+    key matches a configured integration (jira_project_key or github_repo).
+    The matching credentials must be set as environment variables:
+      Jira:   JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN
+      GitHub: GITHUB_TOKEN
+    """
+    project = await _require_project(project_id)
+
+    if not project.external_refs:
+        raise HTTPException(
+            status_code=400,
+            detail="Project has no external_refs — attach a jira_project_key or github_repo first.",
+        )
+
+    try:
+        results = await sync_project(
+            project_id=project_id,
+            external_refs=project.external_refs,
+            sync_store=sync_store,
+            vstore=vstore,
+            integrations=_integrations,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"PM API returned {exc.response.status_code}: {exc.response.text[:200]}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not reach PM API: {exc}",
+        ) from exc
+
+    return {
+        "synced_items": sum(r.items_fetched for r in results),
+        "chunks_stored": sum(r.chunks_stored for r in results),
+        "details": [
+            {
+                "ref_key": r.ref_key,
+                "ref_value": r.ref_value,
+                "items": r.items_fetched,
+                "chunks": r.chunks_stored,
+            }
+            for r in results
+        ],
+    }
+
+
+@app.get("/projects/{project_id}/sync")
+async def get_sync_status(project_id: str):
+    """Return the last-synced timestamp per external ref for this project.
+
+    Useful for displaying sync status in the UI without triggering a sync.
+    Returns an empty refs list if the project has never been synced.
+    """
+    await _require_project(project_id)
+    status = await sync_store.get_sync_status(project_id)
+    return {"refs": status}
 
 
 # ---------------------------------------------------------------------------
@@ -338,33 +463,59 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     # 5. Build the prompt.
     #
     # Deduplication for conversation hits: drop any hit already in recent history.
+    # Also strip prior assistant refusals — when the model has previously claimed
+    # "no access", those replies poison the next prompt by priming the model to
+    # repeat its own pattern.  We drop them here so the updated system message
+    # and retrieved chunks get a clean slate.
     recent_contents = {m["content"] for m in recent}
     unique_hits = [
         h for h in hits
-        if h.session_id == req.session_id and h.content not in recent_contents
+        if h.session_id == req.session_id
+        and h.content not in recent_contents
+        and not (h.role == "assistant" and _looks_like_refusal(h.content))
+    ]
+
+    # Apply the same refusal-filter to the recent SQLite history before
+    # appending it to the prompt — this is the stronger contamination path.
+    sanitized_recent = [
+        m for m in recent
+        if not (m["role"] == "assistant" and _looks_like_refusal(m["content"]))
     ]
 
     messages: list[dict] = []
 
     # Inject relevant document chunks first (highest priority context).
-    # Only include chunks with a reasonable similarity score (> 0.5).
     # Deduplicate by text content — the same chunk may appear multiple times
     # if the same document was ingested more than once.
     seen_texts: set[str] = set()
     relevant_chunks = []
     for c in doc_chunks:
-        if c.score > 0.5 and c.text not in seen_texts:
+        if c.text not in seen_texts:
             seen_texts.add(c.text)
             relevant_chunks.append(c)
     if relevant_chunks:
         doc_lines = "\n".join(
-            f"- [{c.source}]: {c.text}" for c in relevant_chunks
+            f"[{c.source}]\n{c.text}" for c in relevant_chunks
         )
         messages.append({
             "role": "system",
             "content": (
-                "The following excerpts from ingested documents may be relevant "
-                "to the user's question:\n" + doc_lines
+                "You are the project brain for a local-first personal assistant. "
+                "The excerpts below were retrieved from THIS user's own knowledge "
+                "base — ingested documents and PM tickets (Jira / GitHub) synced "
+                "into this project by the user themselves. They are the "
+                "authoritative source of truth for this project.\n\n"
+                "Rules:\n"
+                "1. When the user asks about tickets, issues, tasks, status, or "
+                "   assignees, answer FROM these excerpts.\n"
+                "2. Cite the source label in square brackets, e.g. [jira:KAN-1].\n"
+                "3. Never claim you lack access to the user's PM system — the "
+                "   relevant data is provided to you directly below.\n"
+                "4. If the excerpts do not contain the answer, say so plainly "
+                "   and suggest the user run Sync.\n\n"
+                "--- PROJECT KNOWLEDGE ---\n"
+                f"{doc_lines}\n"
+                "--- END PROJECT KNOWLEDGE ---"
             ),
         })
 
@@ -381,8 +532,17 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
             ),
         })
 
-    # Append recent history and the new user message.
-    messages += recent + [{"role": "user", "content": req.message}]
+    # Append sanitized recent history and the new user message.
+    messages += sanitized_recent + [{"role": "user", "content": req.message}]
+
+    logger.info(
+        "LLM prompt for project=%s session=%s: %d messages, roles=%s, "
+        "doc_chunks=%d, memory_hits=%d, recent=%d",
+        req.project_id, req.session_id, len(messages),
+        [m["role"] for m in messages],
+        len(relevant_chunks), len(unique_hits), len(sanitized_recent),
+    )
+    logger.debug("LLM full messages: %s", messages)
 
     # 6. Call DeepSeek.
     reply = await chat(messages)

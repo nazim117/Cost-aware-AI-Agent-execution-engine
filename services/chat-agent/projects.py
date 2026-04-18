@@ -112,12 +112,32 @@ class ProjectStore:
     # -----------------------------------------------------------------------
     # Project CRUD
     # -----------------------------------------------------------------------
+    async def get_by_name(self, name: str) -> "Project | None":
+        """Return a project whose name matches exactly (case-insensitive), or None."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT id, name, created_at, external_refs FROM projects WHERE LOWER(name) = LOWER(?)",
+                (name,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return Project(
+            id=row[0],
+            name=row[1],
+            created_at=row[2],
+            external_refs=json.loads(row[3] or "{}"),
+        )
+
     async def create(self, name: str, external_refs: dict | None = None) -> Project:
         """Insert a new project and return it.
 
         The id is a random UUID — stable, unique across machines, and safe to
         use in URLs and JSON without escaping.
+        Raises ValueError if a project with the same name already exists.
         """
+        if await self.get_by_name(name) is not None:
+            raise ValueError(f"A project named {name!r} already exists.")
         project_id = str(uuid.uuid4())
         refs = external_refs or {}
         async with aiosqlite.connect(self.db_path) as db:
@@ -210,6 +230,12 @@ class ProjectStore:
 
         new_name = name if name is not None else existing.name
         new_refs = external_refs if external_refs is not None else existing.external_refs
+
+        # Only check for duplicate names when the name is actually changing.
+        if new_name.lower() != existing.name.lower():
+            conflict = await self.get_by_name(new_name)
+            if conflict is not None:
+                raise ValueError(f"A project named {new_name!r} already exists.")
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
