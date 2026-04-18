@@ -42,6 +42,12 @@ function storageSet(values) {
 const projectSelect   = document.getElementById("project-select");
 const newProjectBtn   = document.getElementById("new-project-btn");
 const deleteProjectBtn = document.getElementById("delete-project-btn");
+const settingsBtn     = document.getElementById("settings-btn");
+const settingsPanel   = document.getElementById("settings-panel");
+const jiraKeyInput    = document.getElementById("jira-key-input");
+const githubRepoInput = document.getElementById("github-repo-input");
+const settingsSaveBtn = document.getElementById("settings-save-btn");
+const syncBtn         = document.getElementById("sync-btn");
 const transcript      = document.getElementById("transcript");
 const statusEl        = document.getElementById("status");
 const inputEl         = document.getElementById("input");
@@ -71,6 +77,9 @@ function setBusy(busy) {
   projectSelect.disabled    = busy;
   newProjectBtn.disabled    = busy;
   deleteProjectBtn.disabled = busy || !currentProjectId;
+  settingsBtn.disabled      = busy || !currentProjectId;
+  settingsSaveBtn.disabled  = busy;
+  syncBtn.disabled          = busy || !currentProjectId;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,9 +179,14 @@ async function selectProject(projectId) {
     await storageSet({ sessionByProject });
   }
 
+  // Close settings panel when switching projects.
+  settingsPanel.classList.remove("visible");
+
   renderProjectSelect();
   clearTranscript();
   deleteProjectBtn.disabled = !projectId;
+  settingsBtn.disabled      = !projectId;
+  syncBtn.disabled          = !projectId;
   if (projectId) setStatus("");
   else setStatus("Create a project to get started.");
 }
@@ -219,6 +233,93 @@ async function sendMessage() {
   } finally {
     setBusy(false);
     inputEl.focus();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Settings — attach / update external_refs (Jira key, GitHub repo) for the
+// current project.  The panel toggles open/closed via the ⚙ button.
+// ---------------------------------------------------------------------------
+function populateSettings(projectId) {
+  const project = projects.find((p) => p.id === projectId);
+  const refs = (project && project.external_refs) || {};
+  jiraKeyInput.value    = refs.jira_project_key || "";
+  githubRepoInput.value = refs.github_repo      || "";
+}
+
+function toggleSettings() {
+  settingsPanel.classList.toggle("visible");
+  if (settingsPanel.classList.contains("visible") && currentProjectId) {
+    populateSettings(currentProjectId);
+  }
+}
+
+async function saveProjectSettings() {
+  if (!currentProjectId) return;
+
+  const external_refs = {};
+  const jiraKey = jiraKeyInput.value.trim();
+  const githubRepo = githubRepoInput.value.trim();
+  if (jiraKey)    external_refs.jira_project_key = jiraKey;
+  if (githubRepo) external_refs.github_repo      = githubRepo;
+
+  setBusy(true);
+  setStatus("Saving settings…");
+  try {
+    const response = await fetch(`${AGENT_URL}/projects/${currentProjectId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ external_refs }),
+    });
+    if (!response.ok) throw new Error(`Server returned ${response.status}`);
+    const updated = await response.json();
+    // Reflect the saved refs back into our local list.
+    const idx = projects.findIndex((p) => p.id === currentProjectId);
+    if (idx !== -1) projects[idx] = updated;
+    setStatus("✓ Settings saved");
+    settingsPanel.classList.remove("visible");
+  } catch (err) {
+    setStatus(`⚠ Save failed: ${err.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sync — pull items from Jira / GitHub into the current project's RAG store
+// ---------------------------------------------------------------------------
+async function syncCurrentProject() {
+  if (!currentProjectId) {
+    setStatus("⚠ Create or select a project first.");
+    return;
+  }
+
+  setBusy(true);
+  setStatus("Syncing PM integrations…");
+
+  try {
+    const response = await fetch(
+      `${AGENT_URL}/projects/${currentProjectId}/sync`,
+      { method: "POST" }
+    );
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || `Server returned ${response.status}`);
+    }
+
+    const data = await response.json();
+    if (data.synced_items === 0) {
+      setStatus("✓ Sync complete — no new items since last sync");
+    } else {
+      setStatus(
+        `✓ Sync complete — ${data.synced_items} item(s), ${data.chunks_stored} chunks ingested`
+      );
+    }
+  } catch (err) {
+    setStatus(`⚠ Sync failed: ${err.message}`);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -294,6 +395,9 @@ inputEl.addEventListener("keydown", (e) => {
 usePageBtn.addEventListener("click", useCurrentPage);
 newProjectBtn.addEventListener("click", createProject);
 deleteProjectBtn.addEventListener("click", deleteCurrentProject);
+settingsBtn.addEventListener("click", toggleSettings);
+settingsSaveBtn.addEventListener("click", saveProjectSettings);
+syncBtn.addEventListener("click", syncCurrentProject);
 
 projectSelect.addEventListener("change", (e) => {
   selectProject(e.target.value);

@@ -70,11 +70,13 @@ class Settings(BaseSettings):
 
     # --- Jira Cloud (Step 6, optional) ---
     # Leave empty if you are not using Jira.  All three must be set for the
-    # Jira integration to be active.
-    # base_url looks like "https://your-org.atlassian.net"
-    jira_base_url: str = "https://student-team-fji9lsbv.atlassian.net/"
-    jira_email: str = "499773@student.fontys.nl"
-    jira_api_token: str = "REDACTED_JIRA_API_TOKEN"
+    # Jira integration to be active.  Set them in the .env file at the repo root:
+    #   JIRA_BASE_URL=https://your-org.atlassian.net
+    #   JIRA_EMAIL=you@example.com
+    #   JIRA_API_TOKEN=ATATT3x...
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = ""
 
     # --- GitHub (Step 6, optional) ---
     # A Personal Access Token with repo (private) or public_repo (public) scope.

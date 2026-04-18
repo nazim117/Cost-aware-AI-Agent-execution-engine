@@ -186,6 +186,52 @@
       opacity: 0.4;
       cursor: not-allowed;
     }
+
+    /* ── Project settings panel ── */
+    #settings-panel {
+      padding: 10px 16px;
+      background: #f4f4fb;
+      border-bottom: 1px solid #d9d9e0;
+      flex-shrink: 0;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    #settings-panel.visible {
+      display: flex;
+    }
+
+    #settings-panel label {
+      font-size: 12px;
+      color: #555;
+      font-weight: 500;
+    }
+
+    #settings-panel input {
+      width: 100%;
+      padding: 5px 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-top: 2px;
+    }
+
+    #settings-save-btn {
+      align-self: flex-end;
+      padding: 5px 14px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    #settings-save-btn:hover {
+      opacity: 0.85;
+    }
   </style>
 </head>
 <body>
@@ -197,6 +243,21 @@
     <select id="project-select"></select>
     <button id="new-project-btn" class="icon-btn" title="New project">＋</button>
     <button id="delete-project-btn" class="icon-btn danger" title="Delete current project">🗑</button>
+    <button id="settings-btn" class="icon-btn" title="Project settings (integrations)">⚙</button>
+    <button id="sync-btn" class="icon-btn" title="Sync PM integrations (Jira / GitHub)">⟳</button>
+  </div>
+
+  <!-- Collapsible settings panel — attach Jira / GitHub refs to the current project. -->
+  <div id="settings-panel">
+    <div>
+      <label for="jira-key-input">Jira project key</label>
+      <input id="jira-key-input" type="text" placeholder="e.g. KAN" autocomplete="off" />
+    </div>
+    <div>
+      <label for="github-repo-input">GitHub repo</label>
+      <input id="github-repo-input" type="text" placeholder="e.g. org/repo" autocomplete="off" />
+    </div>
+    <button id="settings-save-btn">Save</button>
   </div>
 
   <div id="transcript"></div>
