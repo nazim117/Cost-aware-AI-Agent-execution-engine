@@ -48,6 +48,10 @@ const jiraKeyInput    = document.getElementById("jira-key-input");
 const githubRepoInput = document.getElementById("github-repo-input");
 const settingsSaveBtn = document.getElementById("settings-save-btn");
 const syncBtn         = document.getElementById("sync-btn");
+const actionsBtn      = document.getElementById("actions-btn");
+const actionsBadge    = document.getElementById("actions-badge");
+const actionsPanel    = document.getElementById("actions-panel");
+const actionsList     = document.getElementById("actions-list");
 const transcript      = document.getElementById("transcript");
 const statusEl        = document.getElementById("status");
 const inputEl         = document.getElementById("input");
@@ -80,6 +84,7 @@ function setBusy(busy) {
   settingsBtn.disabled      = busy || !currentProjectId;
   settingsSaveBtn.disabled  = busy;
   syncBtn.disabled          = busy || !currentProjectId;
+  actionsBtn.disabled       = busy || !currentProjectId;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,16 +184,23 @@ async function selectProject(projectId) {
     await storageSet({ sessionByProject });
   }
 
-  // Close settings panel when switching projects.
+  // Close both panels when switching projects.
   settingsPanel.classList.remove("visible");
+  actionsPanel.classList.remove("visible");
 
   renderProjectSelect();
   clearTranscript();
   deleteProjectBtn.disabled = !projectId;
   settingsBtn.disabled      = !projectId;
   syncBtn.disabled          = !projectId;
-  if (projectId) setStatus("");
-  else setStatus("Create a project to get started.");
+  actionsBtn.disabled       = !projectId;
+  if (projectId) {
+    setStatus("");
+    loadPendingActions(projectId);
+  } else {
+    setStatus("Create a project to get started.");
+    updateActionsBadge(0);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +239,8 @@ async function sendMessage() {
     const data = await response.json();
     appendBubble("assistant", data.reply);
     setStatus("");
+    // Refresh the pending-actions badge — the LLM may have drafted a new action.
+    loadPendingActions(currentProjectId);
   } catch (err) {
     appendBubble("assistant", `⚠ Error: ${err.message}`);
     setStatus("Make sure the chat-agent server is running on port 8084.");
@@ -324,6 +338,132 @@ async function syncCurrentProject() {
 }
 
 // ---------------------------------------------------------------------------
+// Pending actions — approve / reject agent-drafted PM writes
+// ---------------------------------------------------------------------------
+
+function updateActionsBadge(count) {
+  if (count > 0) {
+    actionsBadge.textContent = count;
+    actionsBadge.classList.remove("hidden");
+  } else {
+    actionsBadge.classList.add("hidden");
+  }
+}
+
+async function loadPendingActions(projectId) {
+  if (!projectId) return;
+  try {
+    const resp = await fetch(
+      `${AGENT_URL}/projects/${projectId}/actions?status=pending`
+    );
+    if (!resp.ok) return;
+    const actions = await resp.json();
+    updateActionsBadge(actions.length);
+    renderActionsList(actions);
+  } catch (_) {
+    // Silently ignore if the server is unreachable — badge stays at 0.
+  }
+}
+
+function renderActionsList(actions) {
+  actionsList.innerHTML = "";
+  if (actions.length === 0) {
+    const empty = document.createElement("div");
+    empty.style.cssText = "font-size:12px;color:#888;padding:4px 0;";
+    empty.textContent = "No pending actions.";
+    actionsList.appendChild(empty);
+    return;
+  }
+  for (const action of actions) {
+    const row = document.createElement("div");
+    row.className = "action-row";
+
+    const meta = document.createElement("div");
+    meta.className = "action-meta";
+    meta.textContent = `${action.action_type}  ·  ${action.payload.item_id}`;
+
+    const body = document.createElement("div");
+    body.className = "action-body";
+    const bodyText = action.payload.body || "";
+    body.textContent = bodyText.length > 120 ? bodyText.slice(0, 120) + "…" : bodyText;
+
+    const btns = document.createElement("div");
+    btns.className = "action-btns";
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "approve-btn";
+    approveBtn.textContent = "✓ Approve";
+    approveBtn.addEventListener("click", () => approveAction(action.id));
+
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "reject-btn";
+    rejectBtn.textContent = "✕ Reject";
+    rejectBtn.addEventListener("click", () => rejectAction(action.id));
+
+    btns.appendChild(approveBtn);
+    btns.appendChild(rejectBtn);
+    row.appendChild(meta);
+    row.appendChild(body);
+    row.appendChild(btns);
+    actionsList.appendChild(row);
+  }
+}
+
+function toggleActionsPanel() {
+  actionsPanel.classList.toggle("visible");
+  if (actionsPanel.classList.contains("visible") && currentProjectId) {
+    loadPendingActions(currentProjectId);
+  }
+}
+
+async function approveAction(actionId) {
+  setBusy(true);
+  setStatus("Approving action…");
+  try {
+    const resp = await fetch(`${AGENT_URL}/actions/${actionId}/approve`, {
+      method: "POST",
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `Server returned ${resp.status}`);
+    }
+    const data = await resp.json();
+    const url = data.result?.url;
+    if (url) {
+      setStatus(`✓ Comment posted — ${url}`);
+      // Open the URL in a new tab on click.
+      const statusEl = document.getElementById("status");
+      statusEl.style.cursor = "pointer";
+      statusEl.onclick = () => { chrome.tabs.create({ url }); statusEl.onclick = null; statusEl.style.cursor = ""; };
+    } else {
+      setStatus("✓ Action executed");
+    }
+    await loadPendingActions(currentProjectId);
+  } catch (err) {
+    setStatus(`⚠ Approve failed: ${err.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function rejectAction(actionId) {
+  setBusy(true);
+  setStatus("Rejecting action…");
+  try {
+    const resp = await fetch(`${AGENT_URL}/actions/${actionId}/reject`, {
+      method: "POST",
+    });
+    if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
+    setStatus("✕ Action rejected — nothing was written.");
+    await loadPendingActions(currentProjectId);
+  } catch (err) {
+    setStatus(`⚠ Reject failed: ${err.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Use current page — extract the tab's text, ingest into the current project
 // ---------------------------------------------------------------------------
 async function useCurrentPage() {
@@ -398,6 +538,7 @@ deleteProjectBtn.addEventListener("click", deleteCurrentProject);
 settingsBtn.addEventListener("click", toggleSettings);
 settingsSaveBtn.addEventListener("click", saveProjectSettings);
 syncBtn.addEventListener("click", syncCurrentProject);
+actionsBtn.addEventListener("click", toggleActionsPanel);
 
 projectSelect.addEventListener("change", (e) => {
   selectProject(e.target.value);

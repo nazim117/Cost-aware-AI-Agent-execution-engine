@@ -180,6 +180,91 @@ async def test_prior_refusals_stripped_from_recent_history():
 
 
 @pytest.mark.asyncio
+async def test_draft_action_tag_replaced_with_marker():
+    """When the LLM reply contains <<DRAFT_ACTION>>...<<END>>, the tag is replaced
+    with a human-readable marker and a pending action is created in the store."""
+    _raw_action = (
+        '<<DRAFT_ACTION>>{"action_type":"jira:add_comment",'
+        '"payload":{"item_id":"KAN-1","body":"Smoke test passed","ref_key":"jira_project_key"}}'
+        "<<END>>"
+    )
+    llm_reply = f"I'll draft that comment for you.\n{_raw_action}\nLet me know if you need changes."
+
+    async def _spy_chat(messages):
+        return llm_reply
+
+    with (
+        patch("main.embed", side_effect=_fake_embed),
+        patch("main.rag.retrieve", side_effect=_fake_retrieve_empty),
+        patch("main.chat", side_effect=_spy_chat),
+        patch("main.store.history", new_callable=AsyncMock, return_value=[]),
+        patch("main.store.append", new_callable=AsyncMock),
+        patch("main.vstore.search", new_callable=AsyncMock, return_value=[]),
+        patch("main.vstore.upsert", new_callable=AsyncMock),
+        patch("main._require_project", new_callable=AsyncMock),
+        # Provide a project with a jira ref so the TOOLS block is injected and
+        # action_store.create_pending is reachable via the real in-memory store.
+        patch("main.project_store.get", new_callable=AsyncMock, return_value=MagicMock(
+            id=FAKE_PROJECT_ID,
+            external_refs={"jira_project_key": "KAN"},
+        )),
+        patch("main._integrations", {"jira_project_key": object()}),
+    ):
+        from main import app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/chat", json={
+                "project_id": FAKE_PROJECT_ID,
+                "session_id": FAKE_SESSION_ID,
+                "message": "Please comment on KAN-1 saying the smoke test passed.",
+            })
+
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    # The raw tag must not be in the reply shown to the user.
+    assert "<<DRAFT_ACTION>>" not in reply
+    assert "<<END>>" not in reply
+    # A human-readable marker referencing "Pending Actions" must appear instead.
+    assert "Pending Actions" in reply or "Drafted action" in reply
+
+
+@pytest.mark.asyncio
+async def test_malformed_draft_action_tag_stripped_silently():
+    """A DRAFT_ACTION block with invalid JSON is silently stripped; no 500 error."""
+    bad_reply = "Here is my suggestion.\n<<DRAFT_ACTION>>{not valid json}<<END>>\nDone."
+
+    async def _spy_chat(messages):
+        return bad_reply
+
+    with (
+        patch("main.embed", side_effect=_fake_embed),
+        patch("main.rag.retrieve", side_effect=_fake_retrieve_empty),
+        patch("main.chat", side_effect=_spy_chat),
+        patch("main.store.history", new_callable=AsyncMock, return_value=[]),
+        patch("main.store.append", new_callable=AsyncMock),
+        patch("main.vstore.search", new_callable=AsyncMock, return_value=[]),
+        patch("main.vstore.upsert", new_callable=AsyncMock),
+        patch("main._require_project", new_callable=AsyncMock),
+        patch("main.project_store.get", new_callable=AsyncMock, return_value=MagicMock(
+            id=FAKE_PROJECT_ID,
+            external_refs={"jira_project_key": "KAN"},
+        )),
+        patch("main._integrations", {"jira_project_key": object()}),
+    ):
+        from main import app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/chat", json={
+                "project_id": FAKE_PROJECT_ID,
+                "session_id": FAKE_SESSION_ID,
+                "message": "Summarise KAN-1.",
+            })
+
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    assert "<<DRAFT_ACTION>>" not in reply
+    assert "<<END>>" not in reply
+
+
+@pytest.mark.asyncio
 async def test_source_label_in_prompt():
     """The source label 'jira:KAN-1' appears verbatim in the knowledge block."""
     captured_messages = []

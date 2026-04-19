@@ -20,7 +20,9 @@
 #   rag.py        — chunk + ingest documents; retrieve relevant chunks (per project)
 #   llm.py        — send a message list to DeepSeek, get a reply
 
+import json
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -29,6 +31,7 @@ from pydantic import BaseModel, Field
 
 import httpx
 
+from actions import ActionStore, Action, execute_action, VALID_ACTION_TYPES
 from config import settings
 from embeddings import embed
 from integrations.github import GitHubIntegration
@@ -51,6 +54,7 @@ project_store = ProjectStore(settings.sqlite_path)
 store = ConversationStore(settings.sqlite_path)
 vstore = VectorStore(url=settings.qdrant_url)
 sync_store = SyncStore(settings.sqlite_path)
+action_store = ActionStore(settings.sqlite_path)
 
 # Build the integrations registry at startup — only include adapters whose
 # required credentials are present in the environment.  Unconfigured adapters
@@ -213,6 +217,34 @@ class MemoryHit(BaseModel):
     session_id: str   # Which conversation the hit came from.
 
 
+# --- Pending-action models (Step 7) ----------------------------------------
+class ProposeActionRequest(BaseModel):
+    action_type: str  # Must be in VALID_ACTION_TYPES.
+    payload: dict     # {"item_id": "...", "body": "...", "ref_key": "..."}
+
+
+class ActionOut(BaseModel):
+    id: str
+    project_id: str
+    action_type: str
+    status: str
+    payload: dict
+    created_at: str
+    completed_at: str | None
+
+
+def _action_to_out(a: Action) -> ActionOut:
+    return ActionOut(
+        id=a.id,
+        project_id=a.project_id,
+        action_type=a.action_type,
+        status=a.status,
+        payload=a.payload,
+        created_at=a.created_at,
+        completed_at=a.completed_at,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -302,6 +334,9 @@ async def delete_project(project_id: str):
     await vstore.delete_by_project(settings.qdrant_collection, project_id)
     await vstore.delete_by_project(settings.qdrant_docs_collection, project_id)
     await sync_store.delete_by_project(project_id)
+    # action_store.delete_by_project is also safe to call here even though
+    # sync_store already deleted the same rows — the second DELETE is a no-op.
+    await action_store.delete_by_project(project_id)
 
     deleted = await project_store.delete(project_id)
     if not deleted:
@@ -383,6 +418,98 @@ async def get_sync_status(project_id: str):
     await _require_project(project_id)
     status = await sync_store.get_sync_status(project_id)
     return {"refs": status}
+
+
+# ---------------------------------------------------------------------------
+# Routes — pending actions (Step 7)
+# ---------------------------------------------------------------------------
+
+@app.post("/projects/{project_id}/actions", response_model=ActionOut)
+async def propose_action(project_id: str, req: ProposeActionRequest) -> ActionOut:
+    """Create a pending action for human approval.
+
+    The agent (via the DRAFT_ACTION chat post-processor) or a human in the
+    extension form calls this endpoint.  Nothing is written to Jira/GitHub
+    until /actions/{id}/approve is called.
+    """
+    await _require_project(project_id)
+    if req.action_type not in VALID_ACTION_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown action_type {req.action_type!r}. "
+                   f"Allowed: {sorted(VALID_ACTION_TYPES)}",
+        )
+    for field in ("item_id", "body", "ref_key"):
+        if not req.payload.get(field):
+            raise HTTPException(
+                status_code=400,
+                detail=f"payload must include non-empty '{field}'",
+            )
+    action_id = await action_store.create_pending(
+        project_id, req.action_type, req.payload
+    )
+    action = await action_store.get(action_id)
+    return _action_to_out(action)
+
+
+@app.get("/projects/{project_id}/actions", response_model=list[ActionOut])
+async def list_actions(
+    project_id: str,
+    status: str | None = Query(None, description="Filter by status (e.g. 'pending')."),
+) -> list[ActionOut]:
+    """List actions for a project, newest first. Pass ?status=pending to filter."""
+    await _require_project(project_id)
+    actions = await action_store.list_for_project(project_id, status=status)
+    return [_action_to_out(a) for a in actions]
+
+
+@app.post("/actions/{action_id}/approve")
+async def approve_action(action_id: str):
+    """Approve a pending action and execute it immediately.
+
+    On success: returns {status: "executed", result: {id, url, created_at}}.
+    On integration failure: marks the action as 'failed' and returns 502.
+    """
+    action = await action_store.get(action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail=f"Action {action_id!r} not found.")
+    if action.status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Action {action_id!r} is {action.status!r}, not 'pending'.",
+        )
+
+    await action_store.approve(action_id)
+    # Re-fetch with updated status so execute_action sees it correctly.
+    action = await action_store.get(action_id)
+
+    try:
+        result = await execute_action(action, _integrations, project_store)
+    except Exception as exc:
+        error_msg = str(exc)
+        await action_store.mark_failed(action_id, error_msg)
+        logger.error("Action %s failed: %s", action_id, error_msg)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Integration call failed: {error_msg}",
+        ) from exc
+
+    await action_store.mark_executed(action_id, result)
+    logger.info("Action %s executed: %s", action_id, result.get("url", ""))
+    return {"status": "executed", "result": result}
+
+
+@app.post("/actions/{action_id}/reject")
+async def reject_action(action_id: str):
+    """Reject a pending action. No write is made to the PM system."""
+    action = await action_store.get(action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail=f"Action {action_id!r} not found.")
+    try:
+        await action_store.reject(action_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "rejected"}
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +659,32 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
             ),
         })
 
+    # Inject the TOOLS block when PM integrations are live for this project.
+    # Only shown when the project has at least one ref matching a configured
+    # integration — avoids cluttering prompts for projects with no PM links.
+    project_for_tools = await project_store.get(req.project_id)
+    live_refs = {
+        k for k in (project_for_tools.external_refs if project_for_tools else {})
+        if k in _integrations
+    }
+    if live_refs:
+        messages.append({
+            "role": "system",
+            "content": (
+                "TOOLS YOU CAN PROPOSE\n"
+                "You may propose at most one write action per reply by emitting "
+                "this exact pattern on its own line:\n"
+                "<<DRAFT_ACTION>>"
+                '{"action_type":"jira:add_comment",'
+                '"payload":{"item_id":"ALPHA-12","body":"...","ref_key":"jira_project_key"}}'
+                "<<END>>\n"
+                "Use 'github:add_comment' and 'github_repo' for GitHub issues.\n"
+                "Only propose when the user explicitly asks you to comment on a ticket. "
+                "The user will approve or reject in the Pending Actions panel before "
+                "any write reaches the external system."
+            ),
+        })
+
     # Append sanitized recent history and the new user message.
     messages += sanitized_recent + [{"role": "user", "content": req.message}]
 
@@ -547,7 +700,48 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     # 6. Call DeepSeek.
     reply = await chat(messages)
 
-    # 7. Persist the assistant reply to SQLite.
+    # Post-process the reply: extract <<DRAFT_ACTION>>{...}<<END>> if present.
+    # On success, create a pending action and replace the tag with a human-
+    # readable marker.  On any parse/validation error, strip the tag silently
+    # so the raw JSON never reaches the user's transcript.
+    draft_pattern = re.compile(r"<<DRAFT_ACTION>>(.*?)<<END>>", re.DOTALL)
+    match = draft_pattern.search(reply)
+    if match:
+        raw_json = match.group(1).strip()
+        try:
+            draft = json.loads(raw_json)
+            action_type = draft.get("action_type", "")
+            payload = draft.get("payload", {})
+            if (
+                action_type in VALID_ACTION_TYPES
+                and payload.get("item_id")
+                and payload.get("body")
+                and payload.get("ref_key")
+            ):
+                action_id = await action_store.create_pending(
+                    req.project_id, action_type, payload
+                )
+                replacement = (
+                    f"\n[Drafted action #{action_id[:8]}… — "
+                    "approve in the Pending Actions panel]\n"
+                )
+                logger.info(
+                    "Drafted action %s (type=%s item=%s) for project %s",
+                    action_id, action_type, payload.get("item_id"), req.project_id,
+                )
+            else:
+                replacement = ""
+                logger.warning(
+                    "DRAFT_ACTION block had missing or invalid fields — stripped. "
+                    "action_type=%r payload keys=%s",
+                    action_type, list(payload.keys()),
+                )
+        except (json.JSONDecodeError, TypeError) as exc:
+            replacement = ""
+            logger.warning("Could not parse DRAFT_ACTION block: %s", exc)
+        reply = draft_pattern.sub(replacement, reply).strip()
+
+    # 7. Persist the assistant reply to SQLite (cleaned of any DRAFT_ACTION tags).
     await store.append(req.project_id, req.session_id, "assistant", reply)
 
     # 8. Store the assistant reply vector in Qdrant conversations.

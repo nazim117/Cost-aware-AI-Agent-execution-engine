@@ -281,4 +281,99 @@ async def test_sync_store_delete_by_project(tmp_path):
     assert await store.get_last_synced("proj-2", "github_repo", "org/repo") is not None
 
 
+# ---------------------------------------------------------------------------
+# JiraIntegration.add_comment tests
+# ---------------------------------------------------------------------------
+
+async def test_jira_add_comment_returns_id_and_url():
+    """add_comment POSTs to the correct URL and returns id + deeplink URL."""
+    comment_response = {
+        "id": "12345",
+        "created": "2026-01-01T10:00:00.000+0000",
+    }
+    captured: list[httpx.Request] = []
+
+    class CapturingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req: httpx.Request) -> httpx.Response:
+            captured.append(req)
+            return httpx.Response(201, json=comment_response)
+
+    jira = JiraIntegration(
+        "https://example.atlassian.net", "u@e.com", "tok",
+        transport=CapturingTransport(),
+    )
+
+    result = await jira.add_comment(
+        {"jira_project_key": "ALPHA"}, "ALPHA-12", "Smoke test passed"
+    )
+
+    assert result["id"] == "12345"
+    assert "ALPHA-12" in result["url"]
+    assert "12345" in result["url"]   # focusedCommentId in URL
+    assert captured
+    assert captured[0].method == "POST"
+    assert "/rest/api/3/issue/ALPHA-12/comment" in str(captured[0].url)
+
+
+async def test_jira_add_comment_body_is_adf():
+    """The request body must be valid ADF (not a plain string)."""
+    captured: list[httpx.Request] = []
+
+    class CapturingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req: httpx.Request) -> httpx.Response:
+            captured.append(req)
+            return httpx.Response(201, json={"id": "1", "created": ""})
+
+    jira = JiraIntegration(
+        "https://example.atlassian.net", "u@e.com", "tok",
+        transport=CapturingTransport(),
+    )
+    await jira.add_comment({"jira_project_key": "ALPHA"}, "ALPHA-1", "hello world")
+
+    import json as _json
+    body = _json.loads(captured[0].content)
+    adf = body["body"]
+    assert adf["version"] == 1
+    assert adf["type"] == "doc"
+    assert adf["content"][0]["type"] == "paragraph"
+    assert adf["content"][0]["content"][0]["type"] == "text"
+    assert "hello world" in adf["content"][0]["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# GitHubIntegration.add_comment tests
+# ---------------------------------------------------------------------------
+
+async def test_github_add_comment_returns_id_and_url():
+    """add_comment POSTs to the correct URL and returns id + html_url."""
+    comment_response = {
+        "id": 9876,
+        "html_url": "https://github.com/org/repo/issues/42#issuecomment-9876",
+        "created_at": "2026-01-01T10:00:00Z",
+    }
+    captured: list[httpx.Request] = []
+
+    class CapturingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req: httpx.Request) -> httpx.Response:
+            captured.append(req)
+            return httpx.Response(201, json=comment_response)
+
+    gh = GitHubIntegration("token123", transport=CapturingTransport())
+
+    result = await gh.add_comment({"github_repo": "org/repo"}, "42", "LGTM!")
+
+    assert result["id"] == "9876"
+    assert "issuecomment" in result["url"]
+    assert captured
+    assert captured[0].method == "POST"
+    assert "/repos/org/repo/issues/42/comments" in str(captured[0].url)
+
+
+async def test_github_add_comment_missing_repo_raises():
+    """add_comment raises ValueError when github_repo is absent."""
+    gh = GitHubIntegration("token123")
+    with pytest.raises(ValueError, match="github_repo"):
+        await gh.add_comment({}, "42", "body")
+
+
 pytestmark = pytest.mark.asyncio

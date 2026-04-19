@@ -67,3 +67,18 @@ class PMIntegration(ABC):
         self, external_ref: dict, item_id: str, **kwargs
     ) -> Item:
         raise NotImplementedError("two-way writes are not yet implemented (Step 7)")
+
+    async def add_comment(
+        self, external_ref: dict, item_id: str, body: str
+    ) -> dict:
+        """Post a comment on an existing item.
+
+        Args:
+            external_ref: The slice of project.external_refs for this adapter.
+            item_id:      The adapter-native item identifier (e.g. "ALPHA-12" or "42").
+            body:         Plain-text comment body.
+
+        Returns:
+            {id, url, created_at} from the external system.
+        """
+        raise NotImplementedError("add_comment is not yet implemented for this integration")

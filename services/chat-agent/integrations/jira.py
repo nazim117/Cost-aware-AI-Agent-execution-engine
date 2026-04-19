@@ -80,6 +80,34 @@ class JiraIntegration(PMIntegration):
         # Injected transport for unit tests; None means real network.
         self._transport = transport
 
+    def _client(self) -> httpx.AsyncClient:
+        """Return a configured AsyncClient, reused by all write methods."""
+        return httpx.AsyncClient(
+            auth=self._auth,
+            timeout=30.0,
+            transport=self._transport,
+        )
+
+    @staticmethod
+    def _text_to_adf(text: str) -> dict:
+        """Wrap plain text in an Atlassian Document Format doc node.
+
+        Jira v3 requires comment bodies to be ADF objects, not plain strings.
+        Each non-empty line becomes its own paragraph node.  This is the
+        inverse of _extract_adf_text above.
+        """
+        lines = [l for l in text.splitlines() if l]
+        if not lines:
+            lines = [text]
+        paragraphs = [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": line}],
+            }
+            for line in lines
+        ]
+        return {"version": 1, "type": "doc", "content": paragraphs}
+
     async def fetch_items(
         self,
         external_ref: dict,
@@ -99,11 +127,7 @@ class JiraIntegration(PMIntegration):
         items: list[Item] = []
         start_at = 0
 
-        async with httpx.AsyncClient(
-            auth=self._auth,
-            timeout=30.0,
-            transport=self._transport,
-        ) as client:
+        async with self._client() as client:
             # The new /search/jql API uses cursor-based pagination via
             # nextPageToken.  We loop until the response contains no token.
             next_page_token: str | None = None
@@ -151,3 +175,31 @@ class JiraIntegration(PMIntegration):
                     break
 
         return items
+
+    async def add_comment(
+        self, external_ref: dict, item_id: str, body: str
+    ) -> dict:
+        """Post a comment on a Jira issue.
+
+        Args:
+            external_ref: Must contain "jira_project_key" (used only for context;
+                          the actual target is item_id).
+            item_id:      The Jira issue key, e.g. "ALPHA-12".
+            body:         Plain-text comment.  Wrapped into ADF before sending.
+
+        Returns:
+            {id, url, created_at} from the Jira response.
+        """
+        async with self._client() as client:
+            resp = await client.post(
+                f"{self._base_url}/rest/api/3/issue/{item_id}/comment",
+                json={"body": self._text_to_adf(body)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return {
+            "id": data["id"],
+            # focusedCommentId deep-links the browser directly to the new comment.
+            "url": f"{self._base_url}/browse/{item_id}?focusedCommentId={data['id']}",
+            "created_at": data.get("created", ""),
+        }

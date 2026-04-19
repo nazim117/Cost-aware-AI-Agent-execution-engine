@@ -39,6 +39,15 @@ class GitHubIntegration(PMIntegration):
         self._token = token
         self._transport = transport
 
+    def _headers(self) -> dict:
+        """Return auth + versioning headers shared by all GitHub API calls."""
+        return {
+            "Authorization": f"Bearer {self._token}",
+            # Request the stable v3 media type so the response shape is stable.
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
     async def fetch_items(
         self,
         external_ref: dict,
@@ -48,12 +57,7 @@ class GitHubIntegration(PMIntegration):
         if not repo:
             return []
 
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            # Request the stable v3 media type so the response shape is stable.
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        headers = self._headers()
 
         params: dict = {"state": "all", "per_page": _PAGE_SIZE, "page": 1}
         if updated_since:
@@ -99,3 +103,36 @@ class GitHubIntegration(PMIntegration):
                 params["page"] += 1
 
         return items
+
+    async def add_comment(
+        self, external_ref: dict, item_id: str, body: str
+    ) -> dict:
+        """Post a comment on a GitHub issue or pull request.
+
+        Args:
+            external_ref: Must contain "github_repo" (e.g. "org/repo").
+            item_id:      The issue/PR number as a string, e.g. "42".
+            body:         Markdown-formatted comment body.
+
+        Returns:
+            {id, url, created_at} from the GitHub response.
+        """
+        repo = external_ref.get("github_repo")
+        if not repo:
+            raise ValueError("external_ref must contain 'github_repo'")
+        async with httpx.AsyncClient(
+            headers=self._headers(),
+            timeout=30.0,
+            transport=self._transport,
+        ) as client:
+            resp = await client.post(
+                f"{_API_BASE}/repos/{repo}/issues/{item_id}/comments",
+                json={"body": body},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return {
+            "id": str(data["id"]),
+            "url": data.get("html_url", ""),
+            "created_at": data.get("created_at", ""),
+        }
