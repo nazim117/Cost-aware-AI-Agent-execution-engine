@@ -24,6 +24,8 @@ jobs:
       - name: pytest
         run: pytest -q
         working-directory: services/chat-agent
+        env:
+          DEEPSEEK_API_KEY: test-dummy-key
 
   dashboard-build:
     runs-on: ubuntu-latest
