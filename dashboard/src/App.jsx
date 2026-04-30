@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import * as api from './api.js';
 
@@ -171,7 +171,7 @@ function ProjectPane({ projects, activeId, onSelect, onRefresh, setToast, onBrie
 
 // ─── Chat ─────────────────────────────────────────────────────────────────
 
-function ChatPane({ projectId, onActionDrafted, setToast }) {
+function ChatPane({ projectId, onActionDrafted }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -593,18 +593,18 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [actionsKey, setActionsKey] = useState(0);
   const [briefing, setBriefing] = useState(null);
-  const [briefingLoading, setBriefingLoading] = useState(false);
+  const [, setBriefingLoading] = useState(false);
 
-  async function refreshProjects() {
+  const refreshProjects = useCallback(async () => {
     const list = await api.listProjects();
     setProjects(list);
     if (activeId && !list.find(p => p.id === activeId)) {
       setActiveId(null);
       localStorage.removeItem('projectId');
     }
-  }
+  }, [activeId]);
 
-  useEffect(() => { refreshProjects(); }, []);
+  useEffect(() => { refreshProjects(); }, [refreshProjects]);
 
   function selectProject(id) {
     setActiveId(id);

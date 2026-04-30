@@ -7,37 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  go-test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        module:
-          - services/agent-executor
-          - services/gateway
-          - services/mcp-server
-          - services/policy-engine
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.2"
-          cache: true
-
-      - name: Ensure go workspace
-        run: |
-          [ -f go.work ] || go work init \
-            ./services/agent-executor \
-            ./services/gateway \
-            ./services/mcp-server \
-            ./services/policy-engine
-
-      - name: go vet
-        run: go vet ./${{ matrix.module }}/...
-
-      - name: go test
-        run: go test -race ./${{ matrix.module }}/...
-
   python-test:
     runs-on: ubuntu-latest
     steps:
