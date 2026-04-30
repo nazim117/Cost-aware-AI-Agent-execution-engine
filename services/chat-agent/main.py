@@ -1,4 +1,4 @@
-# main.py — FastAPI application entry point.
+# FastAPI application entry point.
 #
 # This file does three things:
 #   1. Defines the app lifespan (startup / shutdown hooks + schema checks).
@@ -6,14 +6,14 @@
 #   3. Registers the route handlers: /health, /projects (CRUD), /chat,
 #      /ingest, /memory/search.
 #
-# Data flow for POST /chat (Step 5 version):
+# Data flow for POST /chat:
 #   config → projects (validate) → memory (SQLite, scoped by project_id)
 #          → embeddings (Ollama) → vectors (Qdrant, filtered by project_id)
 #          → rag (document retrieval, scoped by project_id) → llm (DeepSeek)
 #
 # Each module has one responsibility:
 #   config.py     — read env vars once at startup
-#   projects.py   — SQLite project store (Step 5+)
+#   projects.py   — SQLite project store
 #   memory.py     — SQLite conversation store (recent history, per project)
 #   embeddings.py — turn text into a 768-float vector via Ollama
 #   vectors.py    — store and search vectors in Qdrant, always filtered by project_id
@@ -41,20 +41,24 @@ from memory import ConversationStore
 from projects import SCHEMA_VERSION, Project, ProjectStore
 import rag
 from sync import SyncStore, sync_project
+from transcript import (
+    ActionItem,
+    Decision,
+    Risk,
+    TranscriptStore,
+    extract_structured,
+)
 from vectors import VectorStore
+import briefing
 
-# Use uvicorn's own logger so our INFO messages appear alongside uvicorn's
-# access log output.  This works whether running via uvicorn CLI or docker.
 logger = logging.getLogger("uvicorn.error")
 
-# ---------------------------------------------------------------------------
-# Shared state — one instance of each store for the whole process.
-# ---------------------------------------------------------------------------
 project_store = ProjectStore(settings.sqlite_path)
 store = ConversationStore(settings.sqlite_path)
 vstore = VectorStore(url=settings.qdrant_url)
 sync_store = SyncStore(settings.sqlite_path)
 action_store = ActionStore(settings.sqlite_path)
+transcript_store = TranscriptStore(settings.sqlite_path)
 
 # Build the integrations registry at startup — only include adapters whose
 # required credentials are present in the environment.  Unconfigured adapters
@@ -74,9 +78,7 @@ if settings.github_token:
 # This must match the dimension used when the Qdrant collections were created.
 EMBED_DIM = 768
 
-# ---------------------------------------------------------------------------
 # Refusal filter — prevent prior LLM refusals from poisoning later prompts.
-# ---------------------------------------------------------------------------
 _REFUSAL_MARKERS = (
     "i do not have access",
     "i don't have access",
@@ -95,9 +97,8 @@ def _looks_like_refusal(text: str) -> bool:
     return any(m in low for m in _REFUSAL_MARKERS)
 
 
-# ---------------------------------------------------------------------------
 # Lifespan — startup initialisation + one-time schema wipe.
-# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure the projects + schema_version tables exist BEFORE we check the
@@ -108,7 +109,7 @@ async def lifespan(app: FastAPI):
     schema_mismatch = previous_version != SCHEMA_VERSION
 
     if schema_mismatch:
-        # Step 5 decision: wipe rather than migrate.  This runs once when
+        # wipe rather than migrate.  This runs once when
         # upgrading from a pre-Step-5 DB (previous_version is None) and again
         # any future time we bump SCHEMA_VERSION.  Loud log line on purpose.
         logger.warning(
@@ -127,9 +128,10 @@ async def lifespan(app: FastAPI):
         await vstore.ensure_collection(settings.qdrant_collection, dim=EMBED_DIM)
         await vstore.ensure_collection(settings.qdrant_docs_collection, dim=EMBED_DIM)
 
-    # SyncStore tables are always safe to create — no schema coupling to the
-    # version wipe above.
+    # SyncStore and TranscriptStore tables are always safe to create — no
+    # schema coupling to the version wipe above.
     await sync_store.init()
+    await transcript_store.init()
 
     yield
     # Shutdown: no explicit cleanup needed for either store.
@@ -137,7 +139,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="chat-agent", lifespan=lifespan)
 
-# ---------------------------------------------------------------------------
 # CORS — allow the Chrome extension (and any localhost origin) to call this API.
 #
 # Why allow_origins=["*"]?
@@ -145,7 +146,6 @@ app = FastAPI(title="chat-agent", lifespan=lifespan)
 #   changes every time an unpacked extension is reloaded in developer mode, so
 #   we cannot hard-code it.  Since this server only listens on localhost and is
 #   never exposed to the internet, allowing all origins is safe.
-# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -154,15 +154,10 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-# --- Project CRUD models ---------------------------------------------------
+# Project CRUD models
 class ProjectCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, description="Human-readable project name.")
     # Optional bag of external references (Jira key, GitHub repo, ...).
-    # Reserved in Step 5; populated by Step 6 integrations.
     external_refs: dict = Field(default_factory=dict)
 
 
@@ -189,38 +184,112 @@ def _project_to_out(p: Project) -> ProjectOut:
     )
 
 
-# --- Chat / ingest models (all now require project_id) --------------------
+# Chat / ingest models (all now require project_id)
 class ChatRequest(BaseModel):
-    project_id: str   # Which project brain owns this conversation.
-    session_id: str   # Identifies which conversation inside the project.
-    message: str      # The user's input text.
+    project_id: str  # Which project brain owns this conversation.
+    session_id: str  # Identifies which conversation inside the project.
+    message: str  # The user's input text.
+
+
+class Citation(BaseModel):
+    ref: int  # 1-based reference number matching [N] in the reply text.
+    source: str  # The source label (e.g. "jira:KAN-1", "notes.md").
+    chunk_index: int  # Position of this chunk in the original document (0-based).
 
 
 class ChatResponse(BaseModel):
-    reply: str        # The assistant's reply text.
+    reply: str  # The assistant's reply text.
+    citations: list[Citation] = []  # Chunks the reply may have drawn from.
 
 
 class IngestRequest(BaseModel):
-    project_id: str   # Which project brain to add this document to.
-    source: str       # A label for the document — filename, URL, or any identifier.
-    text: str         # The full document text to index.
+    project_id: str  # Which project brain to add this document to.
+    source: str  # A label for the document — filename, URL, or any identifier.
+    text: str  # The full document text to index.
 
 
 class IngestResponse(BaseModel):
-    chunks: int       # How many chunks were stored in Qdrant.
+    chunks: int  # How many chunks were stored in Qdrant.
+
+
+class IngestTranscriptRequest(BaseModel):
+    project_id: str  # Which project brain owns this transcript.
+    source: str  # Label for the meeting (e.g. "meeting-2026-05-12").
+    text: str  # Raw transcript text.
+
+
+class IngestTranscriptResponse(BaseModel):
+    chunks: int  # RAG chunks stored in Qdrant.
+    decisions: int  # Structured decisions extracted + stored.
+    action_items: int  # Structured action items extracted + stored.
+    risks: int  # Structured risks extracted + stored.
+
+
+class DecisionOut(BaseModel):
+    id: str
+    source: str
+    text: str
+    created_at: str
+
+
+class ActionItemOut(BaseModel):
+    id: str
+    source: str
+    owner: str | None
+    text: str
+    due_date: str | None
+    status: str
+    created_at: str
+
+
+class RiskOut(BaseModel):
+    id: str
+    source: str
+    text: str
+    created_at: str
+
+
+class BriefActionOut(BaseModel):
+    id: str
+    text: str
+    owner: str | None
+    due_date: str | None
+    status: str
+    source: str
+
+
+class BriefDecisionOut(BaseModel):
+    id: str
+    text: str
+    source: str
+    created_at: str
+
+
+class BriefRiskOut(BaseModel):
+    id: str
+    text: str
+    source: str
+    created_at: str
+
+
+class BriefingOut(BaseModel):
+    summary: str
+    open_actions: list[BriefActionOut]
+    recent_decisions: list[BriefDecisionOut]
+    active_risks: list[BriefRiskOut]
+    generated_at: str
 
 
 class MemoryHit(BaseModel):
-    score: float      # Cosine similarity (0–1, higher = more similar).
-    role: str         # 'user' or 'assistant'.
-    content: str      # The original message text.
-    session_id: str   # Which conversation the hit came from.
+    score: float  # Cosine similarity (0–1, higher = more similar).
+    role: str  # 'user' or 'assistant'.
+    content: str  # The original message text.
+    session_id: str  # Which conversation the hit came from.
 
 
-# --- Pending-action models (Step 7) ----------------------------------------
 class ProposeActionRequest(BaseModel):
     action_type: str  # Must be in VALID_ACTION_TYPES.
-    payload: dict     # {"item_id": "...", "body": "...", "ref_key": "..."}
+    payload: dict  # {"item_id": "...", "body": "...", "ref_key": "..."}
 
 
 class ActionOut(BaseModel):
@@ -245,9 +314,7 @@ def _action_to_out(a: Action) -> ActionOut:
     )
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 async def _require_project(project_id: str) -> Project:
     """Return the project, or raise 404.
 
@@ -263,18 +330,14 @@ async def _require_project(project_id: str) -> Project:
     return project
 
 
-# ---------------------------------------------------------------------------
 # Routes — liveness
-# ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     """Liveness check.  Returns 200 OK when the service is running."""
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
 # Routes — project CRUD
-# ---------------------------------------------------------------------------
 @app.post("/projects", response_model=ProjectOut)
 async def post_projects(req: ProjectCreateRequest) -> ProjectOut:
     """Create a new project brain.
@@ -301,10 +364,7 @@ async def get_projects() -> list[ProjectOut]:
 
 @app.patch("/projects/{project_id}", response_model=ProjectOut)
 async def patch_project(project_id: str, req: ProjectUpdateRequest) -> ProjectOut:
-    """Partial update — change name and/or external_refs.
-
-    Step 6 uses this to attach a Jira project key or GitHub repo to a brain.
-    """
+    """Partial update — change name and/or external_refs."""
     try:
         updated = await project_store.update(
             project_id,
@@ -314,7 +374,9 @@ async def patch_project(project_id: str, req: ProjectUpdateRequest) -> ProjectOu
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     if updated is None:
-        raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found.")
+        raise HTTPException(
+            status_code=404, detail=f"Project {project_id!r} not found."
+        )
     return _project_to_out(updated)
 
 
@@ -337,18 +399,19 @@ async def delete_project(project_id: str):
     # action_store.delete_by_project is also safe to call here even though
     # sync_store already deleted the same rows — the second DELETE is a no-op.
     await action_store.delete_by_project(project_id)
+    await transcript_store.delete_by_project(project_id)
 
     deleted = await project_store.delete(project_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found.")
+        raise HTTPException(
+            status_code=404, detail=f"Project {project_id!r} not found."
+        )
 
     logger.info("Deleted project %s and all of its memory.", project_id)
     return {"deleted": True}
 
 
-# ---------------------------------------------------------------------------
-# Routes — PM sync (Step 6)
-# ---------------------------------------------------------------------------
+# Routes — PM sync
 
 @app.post("/projects/{project_id}/sync")
 async def post_sync(project_id: str):
@@ -420,9 +483,7 @@ async def get_sync_status(project_id: str):
     return {"refs": status}
 
 
-# ---------------------------------------------------------------------------
-# Routes — pending actions (Step 7)
-# ---------------------------------------------------------------------------
+# Routes — pending actions
 
 @app.post("/projects/{project_id}/actions", response_model=ActionOut)
 async def propose_action(project_id: str, req: ProposeActionRequest) -> ActionOut:
@@ -437,7 +498,7 @@ async def propose_action(project_id: str, req: ProposeActionRequest) -> ActionOu
         raise HTTPException(
             status_code=400,
             detail=f"Unknown action_type {req.action_type!r}. "
-                   f"Allowed: {sorted(VALID_ACTION_TYPES)}",
+            f"Allowed: {sorted(VALID_ACTION_TYPES)}",
         )
     for field in ("item_id", "body", "ref_key"):
         if not req.payload.get(field):
@@ -512,9 +573,7 @@ async def reject_action(action_id: str):
     return {"status": "rejected"}
 
 
-# ---------------------------------------------------------------------------
 # Routes — chat + ingest + memory search (now project-scoped)
-# ---------------------------------------------------------------------------
 @app.post("/ingest", response_model=IngestResponse)
 async def post_ingest(req: IngestRequest) -> IngestResponse:
     """Split a document into chunks, embed them, and store them in Qdrant
@@ -531,6 +590,146 @@ async def post_ingest(req: IngestRequest) -> IngestResponse:
     await _require_project(req.project_id)
     n = await rag.ingest(req.project_id, req.source, req.text, vstore)
     return IngestResponse(chunks=n)
+
+
+@app.post("/ingest/transcript", response_model=IngestTranscriptResponse)
+async def post_ingest_transcript(
+    req: IngestTranscriptRequest,
+) -> IngestTranscriptResponse:
+    """Two-phase transcript ingest:
+
+    Phase 1 — chunk the raw text and store vectors in Qdrant (same as /ingest).
+              This makes the transcript searchable from /chat.
+    Phase 2 — send the full text to the LLM for structured extraction.
+              Decisions, action items, and risks are stored in SQLite tables
+              so they can be queried with exact filters (e.g. status=open).
+
+    Idempotent: re-posting the same `source` replaces prior content.
+    """
+    await _require_project(req.project_id)
+
+    # Phase 1 — delete old vector chunks for this source, then re-ingest.
+    await vstore.delete_by_source(
+        settings.qdrant_docs_collection, req.project_id, req.source
+    )
+    chunk_count = await rag.ingest(req.project_id, req.source, req.text, vstore)
+
+    # Phase 2 — delete old structured rows, then re-extract.
+    await transcript_store.delete_by_source(req.project_id, req.source)
+    try:
+        extracted = await extract_structured(req.text, chat)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Structured extraction failed: {exc}",
+        ) from exc
+
+    counts = await transcript_store.save_extracted(
+        req.project_id, req.source, extracted
+    )
+    logger.info(
+        "Transcript[%s] source=%r: %d chunks, %d decisions, %d action_items, %d risks",
+        req.project_id,
+        req.source,
+        chunk_count,
+        counts["decisions"],
+        counts["action_items"],
+        counts["risks"],
+    )
+    return IngestTranscriptResponse(
+        chunks=chunk_count,
+        decisions=counts["decisions"],
+        action_items=counts["action_items"],
+        risks=counts["risks"],
+    )
+
+
+@app.get("/projects/{project_id}/decisions", response_model=list[DecisionOut])
+async def get_decisions(project_id: str) -> list[DecisionOut]:
+    """List all decisions extracted from transcripts for this project, newest first."""
+    await _require_project(project_id)
+    rows = await transcript_store.list_decisions(project_id)
+    return [
+        DecisionOut(id=r.id, source=r.source, text=r.text, created_at=r.created_at)
+        for r in rows
+    ]
+
+
+@app.get("/projects/{project_id}/action-items", response_model=list[ActionItemOut])
+async def get_action_items(
+    project_id: str,
+    status: str | None = Query(None, description="Filter by status: 'open' or 'done'."),
+) -> list[ActionItemOut]:
+    """List transcript action items. Pass ?status=open to see only open items."""
+    await _require_project(project_id)
+    if status and status not in ("open", "done"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status {status!r}. Use 'open' or 'done'.",
+        )
+    rows = await transcript_store.list_action_items(project_id, status=status)
+    return [
+        ActionItemOut(
+            id=r.id,
+            source=r.source,
+            owner=r.owner,
+            text=r.text,
+            due_date=r.due_date,
+            status=r.status,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+@app.get("/projects/{project_id}/risks", response_model=list[RiskOut])
+async def get_risks(project_id: str) -> list[RiskOut]:
+    """List all risks extracted from transcripts for this project, newest first."""
+    await _require_project(project_id)
+    rows = await transcript_store.list_risks(project_id)
+    return [
+        RiskOut(id=r.id, source=r.source, text=r.text, created_at=r.created_at)
+        for r in rows
+    ]
+
+
+@app.get("/projects/{project_id}/briefing", response_model=BriefingOut)
+async def get_briefing(project_id: str) -> BriefingOut:
+    """Return a concise status snapshot for the project: open actions, recent decisions, active risks, and an AI-generated summary."""
+    await _require_project(project_id)
+
+    b = await briefing.assemble_briefing(
+        project_id=project_id,
+        transcript_store=transcript_store,
+        vector_store=vstore,
+        chat_fn=chat,
+    )
+
+    return BriefingOut(
+        summary=b.summary,
+        open_actions=[
+            BriefActionOut(
+                id=a.id,
+                text=a.text,
+                owner=a.owner,
+                due_date=a.due_date,
+                status=a.status,
+                source=a.source,
+            )
+            for a in b.open_actions
+        ],
+        recent_decisions=[
+            BriefDecisionOut(
+                id=d.id, text=d.text, source=d.source, created_at=d.created_at
+            )
+            for d in b.recent_decisions
+        ],
+        active_risks=[
+            BriefRiskOut(id=r.id, text=r.text, source=r.source, created_at=r.created_at)
+            for r in b.active_risks
+        ],
+        generated_at=b.generated_at,
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -596,7 +795,8 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     # and retrieved chunks get a clean slate.
     recent_contents = {m["content"] for m in recent}
     unique_hits = [
-        h for h in hits
+        h
+        for h in hits
         if h.session_id == req.session_id
         and h.content not in recent_contents
         and not (h.role == "assistant" and _looks_like_refusal(h.content))
@@ -605,7 +805,8 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     # Apply the same refusal-filter to the recent SQLite history before
     # appending it to the prompt — this is the stronger contamination path.
     sanitized_recent = [
-        m for m in recent
+        m
+        for m in recent
         if not (m["role"] == "assistant" and _looks_like_refusal(m["content"]))
     ]
 
@@ -620,70 +821,88 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
         if c.text not in seen_texts:
             seen_texts.add(c.text)
             relevant_chunks.append(c)
+
+    # Build citations list for the API response. ref is 1-based and matches
+    # the [N] numbers injected into the prompt below.
+    citations = [
+        Citation(ref=i + 1, source=c.source, chunk_index=c.chunk_index)
+        for i, c in enumerate(relevant_chunks)
+    ]
+
     if relevant_chunks:
-        doc_lines = "\n".join(
-            f"[{c.source}]\n{c.text}" for c in relevant_chunks
+        # Number each chunk so the model can cite precisely (e.g. "[1]") rather
+        # than copying the full source label — shorter and less error-prone.
+        doc_lines = "\n\n".join(
+            f"[{i + 1}] source: {c.source} (chunk {c.chunk_index})\n{c.text}"
+            for i, c in enumerate(relevant_chunks)
         )
-        messages.append({
-            "role": "system",
-            "content": (
-                "You are the project brain for a local-first personal assistant. "
-                "The excerpts below were retrieved from THIS user's own knowledge "
-                "base — ingested documents and PM tickets (Jira / GitHub) synced "
-                "into this project by the user themselves. They are the "
-                "authoritative source of truth for this project.\n\n"
-                "Rules:\n"
-                "1. When the user asks about tickets, issues, tasks, status, or "
-                "   assignees, answer FROM these excerpts.\n"
-                "2. Cite the source label in square brackets, e.g. [jira:KAN-1].\n"
-                "3. Never claim you lack access to the user's PM system — the "
-                "   relevant data is provided to you directly below.\n"
-                "4. If the excerpts do not contain the answer, say so plainly "
-                "   and suggest the user run Sync.\n\n"
-                "--- PROJECT KNOWLEDGE ---\n"
-                f"{doc_lines}\n"
-                "--- END PROJECT KNOWLEDGE ---"
-            ),
-        })
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "You are the project brain for a local-first personal assistant. "
+                    "The excerpts below were retrieved from THIS user's own knowledge "
+                    "base — ingested documents and PM tickets (Jira / GitHub) synced "
+                    "into this project by the user themselves. They are the "
+                    "authoritative source of truth for this project.\n\n"
+                    "Rules:\n"
+                    "1. When the user asks about tickets, issues, tasks, status, or "
+                    "   assignees, answer FROM these excerpts.\n"
+                    "2. Cite by reference number, e.g. [1], when you use information "
+                    "   from a chunk. You may also include the source label for "
+                    "   clarity, e.g. [1][jira:KAN-1].\n"
+                    "3. Never claim you lack access to the user's PM system — the "
+                    "   relevant data is provided to you directly below.\n"
+                    "4. If the excerpts do not contain the answer, say so plainly "
+                    "   and suggest the user run Sync.\n\n"
+                    "--- PROJECT KNOWLEDGE ---\n"
+                    f"{doc_lines}\n"
+                    "--- END PROJECT KNOWLEDGE ---"
+                ),
+            }
+        )
 
     # Then inject relevant past conversation messages.
     if unique_hits:
-        context_lines = "\n".join(
-            f"- [{h.role}]: {h.content}" for h in unique_hits
+        context_lines = "\n".join(f"- [{h.role}]: {h.content}" for h in unique_hits)
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "The following messages from earlier in this conversation may be "
+                    "relevant to the user's current question:\n" + context_lines
+                ),
+            }
         )
-        messages.append({
-            "role": "system",
-            "content": (
-                "The following messages from earlier in this conversation may be "
-                "relevant to the user's current question:\n" + context_lines
-            ),
-        })
 
     # Inject the TOOLS block when PM integrations are live for this project.
     # Only shown when the project has at least one ref matching a configured
     # integration — avoids cluttering prompts for projects with no PM links.
     project_for_tools = await project_store.get(req.project_id)
     live_refs = {
-        k for k in (project_for_tools.external_refs if project_for_tools else {})
+        k
+        for k in (project_for_tools.external_refs if project_for_tools else {})
         if k in _integrations
     }
     if live_refs:
-        messages.append({
-            "role": "system",
-            "content": (
-                "TOOLS YOU CAN PROPOSE\n"
-                "You may propose at most one write action per reply by emitting "
-                "this exact pattern on its own line:\n"
-                "<<DRAFT_ACTION>>"
-                '{"action_type":"jira:add_comment",'
-                '"payload":{"item_id":"ALPHA-12","body":"...","ref_key":"jira_project_key"}}'
-                "<<END>>\n"
-                "Use 'github:add_comment' and 'github_repo' for GitHub issues.\n"
-                "Only propose when the user explicitly asks you to comment on a ticket. "
-                "The user will approve or reject in the Pending Actions panel before "
-                "any write reaches the external system."
-            ),
-        })
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "TOOLS YOU CAN PROPOSE\n"
+                    "You may propose at most one write action per reply by emitting "
+                    "this exact pattern on its own line:\n"
+                    "<<DRAFT_ACTION>>"
+                    '{"action_type":"jira:add_comment",'
+                    '"payload":{"item_id":"ALPHA-12","body":"...","ref_key":"jira_project_key"}}'
+                    "<<END>>\n"
+                    "Use 'github:add_comment' and 'github_repo' for GitHub issues.\n"
+                    "Only propose when the user explicitly asks you to comment on a ticket. "
+                    "The user will approve or reject in the Pending Actions panel before "
+                    "any write reaches the external system."
+                ),
+            }
+        )
 
     # Append sanitized recent history and the new user message.
     messages += sanitized_recent + [{"role": "user", "content": req.message}]
@@ -691,9 +910,13 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     logger.info(
         "LLM prompt for project=%s session=%s: %d messages, roles=%s, "
         "doc_chunks=%d, memory_hits=%d, recent=%d",
-        req.project_id, req.session_id, len(messages),
+        req.project_id,
+        req.session_id,
+        len(messages),
         [m["role"] for m in messages],
-        len(relevant_chunks), len(unique_hits), len(sanitized_recent),
+        len(relevant_chunks),
+        len(unique_hits),
+        len(sanitized_recent),
     )
     logger.debug("LLM full messages: %s", messages)
 
@@ -727,14 +950,18 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
                 )
                 logger.info(
                     "Drafted action %s (type=%s item=%s) for project %s",
-                    action_id, action_type, payload.get("item_id"), req.project_id,
+                    action_id,
+                    action_type,
+                    payload.get("item_id"),
+                    req.project_id,
                 )
             else:
                 replacement = ""
                 logger.warning(
                     "DRAFT_ACTION block had missing or invalid fields — stripped. "
                     "action_type=%r payload keys=%s",
-                    action_type, list(payload.keys()),
+                    action_type,
+                    list(payload.keys()),
                 )
         except (json.JSONDecodeError, TypeError) as exc:
             replacement = ""
@@ -754,7 +981,7 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     )
 
     # 9. Return.
-    return ChatResponse(reply=reply)
+    return ChatResponse(reply=reply, citations=citations)
 
 
 @app.get("/memory/search", response_model=list[MemoryHit])

@@ -1,7 +1,6 @@
-# projects.py — SQLite-backed project store.
+# SQLite-backed project store.
 #
 # Why projects?
-#   In Steps 1–4 the agent had one global "brain" — a single conversation
 #   history and a single document corpus.  Useful for a demo, but real
 #   knowledge workers juggle multiple workstreams (Project Alpha, Project
 #   Beta, Project Gamma).  Dumping everything into one brain means:
@@ -14,21 +13,7 @@
 #   message, vector, and ingested document is tagged with the project's id
 #   so searches stay scoped.
 #
-# Schema — two tables owned by this module:
-#
-#   projects
-#   ├── id             TEXT PK   UUID string — stable, unique, client-safe
-#   ├── name           TEXT      human-readable label shown in the UI
-#   ├── created_at     TEXT      ISO-8601 timestamp set by SQLite on insert
-#   └── external_refs  TEXT      JSON map, e.g. {"jira_project_key": "ALPHA"}
-#                                Reserved in Step 5; populated in Step 6.
-#
-#   schema_version
-#   ├── version  INTEGER   single-row table; current schema version number.
-#
 # Why a schema_version table?
-#   Step 5 changes the shape of `messages` (it gains project_id).  A running
-#   service with a pre-Step-5 database would read the old rows and get NULL
 #   for project_id, which would break every query.  Recording the schema
 #   version lets startup code detect the mismatch and wipe-and-recreate.
 #   (Per owner decision: we wipe existing data rather than migrate.)
@@ -40,7 +25,6 @@ from dataclasses import dataclass, field
 import aiosqlite
 
 # Bump this whenever the SQL schema changes in an incompatible way.
-# Step 5 is the first schema version worth recording.
 SCHEMA_VERSION = 1
 
 
@@ -50,7 +34,6 @@ class Project:
     id: str
     name: str
     created_at: str
-    # Free-form adapter references; consumed by Step 6 integrations.
     # Example: {"jira_project_key": "ALPHA", "github_repo": "org/repo"}.
     external_refs: dict = field(default_factory=dict)
 
@@ -92,9 +75,7 @@ class ProjectStore:
             )
             await db.commit()
 
-    # -----------------------------------------------------------------------
     # Schema version helpers — used by main.py to decide whether to wipe
-    # -----------------------------------------------------------------------
     async def current_version(self) -> int | None:
         """Return the recorded schema version, or None if never written."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -109,9 +90,7 @@ class ProjectStore:
             await db.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
             await db.commit()
 
-    # -----------------------------------------------------------------------
     # Project CRUD
-    # -----------------------------------------------------------------------
     async def get_by_name(self, name: str) -> "Project | None":
         """Return a project whose name matches exactly (case-insensitive), or None."""
         async with aiosqlite.connect(self.db_path) as db:

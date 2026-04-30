@@ -1,0 +1,10 @@
+[extend]
+# Inherit the default gitleaks ruleset, then add/override below
+useDefault = true
+
+[allowlist]
+description = "Allow sk- prefix in docs and test fixtures only"
+paths = [
+  "docs/",
+  "services/chat-agent/tests/",
+]

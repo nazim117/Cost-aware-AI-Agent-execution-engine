@@ -105,6 +105,10 @@ async def test_doc_chunk_produces_project_knowledge_block():
     )
     assert "jira:KAN-1" in knowledge_block["content"]
     assert "authoritative" in knowledge_block["content"].lower()
+    # The chunk must be numbered — [1] prefix must appear in the block.
+    assert "[1]" in knowledge_block["content"], (
+        "Expected numbered reference [1] in the knowledge block"
+    )
 
 
 @pytest.mark.asyncio
@@ -293,3 +297,120 @@ async def test_source_label_in_prompt():
 
     all_content = " ".join(m["content"] for m in captured_messages)
     assert "jira:KAN-1" in all_content
+
+
+# ---------------------------------------------------------------------------
+# Citation tests (Step 9)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_one_chunk_produces_citations_array():
+    """When one chunk is retrieved, /chat returns citations=[{ref:1, source, chunk_index}]."""
+    async def _spy_chat(messages):
+        return "KAN-1 is in progress [1]."
+
+    with (
+        patch("main.embed", side_effect=_fake_embed),
+        patch("main.rag.retrieve", side_effect=_fake_retrieve),
+        patch("main.chat", side_effect=_spy_chat),
+        patch("main.store.history", new_callable=AsyncMock, return_value=[]),
+        patch("main.store.append", new_callable=AsyncMock),
+        patch("main.vstore.search", new_callable=AsyncMock, return_value=[]),
+        patch("main.vstore.upsert", new_callable=AsyncMock),
+        patch("main._require_project", new_callable=AsyncMock),
+    ):
+        from main import app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/chat", json={
+                "project_id": FAKE_PROJECT_ID,
+                "session_id": FAKE_SESSION_ID,
+                "message": "What is KAN-1?",
+            })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "citations" in data
+    assert len(data["citations"]) == 1
+    cit = data["citations"][0]
+    assert cit["ref"] == 1
+    assert cit["source"] == "jira:KAN-1"
+    assert cit["chunk_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_chunks_produces_empty_citations():
+    """When rag.retrieve returns nothing, citations is an empty list."""
+    async def _spy_chat(messages):
+        return "I don't have that information."
+
+    with (
+        patch("main.embed", side_effect=_fake_embed),
+        patch("main.rag.retrieve", side_effect=_fake_retrieve_empty),
+        patch("main.chat", side_effect=_spy_chat),
+        patch("main.store.history", new_callable=AsyncMock, return_value=[]),
+        patch("main.store.append", new_callable=AsyncMock),
+        patch("main.vstore.search", new_callable=AsyncMock, return_value=[]),
+        patch("main.vstore.upsert", new_callable=AsyncMock),
+        patch("main._require_project", new_callable=AsyncMock),
+    ):
+        from main import app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/chat", json={
+                "project_id": FAKE_PROJECT_ID,
+                "session_id": FAKE_SESSION_ID,
+                "message": "What happened last sprint?",
+            })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["citations"] == []
+
+
+@pytest.mark.asyncio
+async def test_two_chunks_produce_ordered_citations():
+    """Two distinct chunks produce refs [1] and [2] in the prompt and citations array."""
+    from rag import Chunk
+    chunk_a = Chunk(score=0.9, source="jira:KAN-1", chunk_index=0, text="First chunk content")
+    chunk_b = Chunk(score=0.8, source="notes.md", chunk_index=2, text="Second chunk content")
+
+    async def _retrieve_two(_project_id, _query, k, vstore):
+        return [chunk_a, chunk_b]
+
+    captured_messages = []
+
+    async def _spy_chat(messages):
+        captured_messages.extend(messages)
+        return "Answer draws on [1] and [2]."
+
+    with (
+        patch("main.embed", side_effect=_fake_embed),
+        patch("main.rag.retrieve", side_effect=_retrieve_two),
+        patch("main.chat", side_effect=_spy_chat),
+        patch("main.store.history", new_callable=AsyncMock, return_value=[]),
+        patch("main.store.append", new_callable=AsyncMock),
+        patch("main.vstore.search", new_callable=AsyncMock, return_value=[]),
+        patch("main.vstore.upsert", new_callable=AsyncMock),
+        patch("main._require_project", new_callable=AsyncMock),
+    ):
+        from main import app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/chat", json={
+                "project_id": FAKE_PROJECT_ID,
+                "session_id": FAKE_SESSION_ID,
+                "message": "Summarise recent work.",
+            })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["citations"]) == 2
+    assert data["citations"][0] == {"ref": 1, "source": "jira:KAN-1", "chunk_index": 0}
+    assert data["citations"][1] == {"ref": 2, "source": "notes.md", "chunk_index": 2}
+
+    # Both [1] and [2] must appear in the knowledge block sent to the LLM.
+    knowledge_block = next(
+        (m for m in captured_messages if "PROJECT KNOWLEDGE" in m.get("content", "")),
+        None,
+    )
+    assert knowledge_block is not None
+    assert "[1]" in knowledge_block["content"]
+    assert "[2]" in knowledge_block["content"]

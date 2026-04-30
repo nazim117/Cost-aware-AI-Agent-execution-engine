@@ -1,4 +1,4 @@
-# memory.py — SQLite-backed conversation store.
+# SQLite-backed conversation store.
 #
 # Why SQLite?
 #   An in-memory dict would work while the server is running, but the moment
@@ -10,17 +10,7 @@
 #   makes blocking system calls — while waiting for a disk write, it would freeze
 #   the entire event loop and block every other request.  aiosqlite wraps sqlite3
 #   in a background thread and gives us `await`-able versions of every call.
-#
-# Schema — one table, six columns:
-#
-#   messages
-#   ├── id          INTEGER  auto-incrementing primary key
-#   ├── project_id  TEXT     which project this message belongs to (Step 5+)
-#   ├── session_id  TEXT     groups messages into one conversation
-#   ├── role        TEXT     'user' or 'assistant'  (DeepSeek's terminology)
-#   ├── content     TEXT     the message body
-#   └── created_at  TEXT     ISO-8601 timestamp set by SQLite on insert
-#
+
 # Why the composite (project_id, session_id) index?
 #   Every read scopes by BOTH project_id and session_id — never by one alone.
 #   A single-column index on session_id would force SQLite to scan every row
@@ -71,7 +61,6 @@ class ConversationStore:
         """Drop and recreate the messages table.
 
         Called by startup code when schema_version mismatches.  Per the
-        Step 5 plan, we wipe rather than migrate pre-Step-5 data.  This is
         deliberately loud — it runs exactly once per schema bump.
         """
         async with aiosqlite.connect(self.db_path) as db:

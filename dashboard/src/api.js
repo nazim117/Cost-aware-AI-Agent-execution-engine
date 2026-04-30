@@ -35,3 +35,22 @@ export const listActions = (projectId, status) => {
 };
 export const approveAction = (actionId) => request('POST', `/actions/${actionId}/approve`);
 export const rejectAction = (actionId) => request('POST', `/actions/${actionId}/reject`);
+
+// Step 10: Transcript processing
+export const ingestTranscript = (projectId, source, text) =>
+  request('POST', '/ingest/transcript', { project_id: projectId, source, text });
+
+export const listDecisions = (projectId) =>
+  request('GET', `/projects/${projectId}/decisions`);
+
+export const listActionItems = (projectId, status) => {
+  const qs = status ? `?status=${status}` : '';
+  return request('GET', `/projects/${projectId}/action-items${qs}`);
+};
+
+export const listRisks = (projectId) =>
+  request('GET', `/projects/${projectId}/risks`);
+
+// Step 11: Project briefing
+export const getBriefing = (projectId) =>
+  request('GET', `/projects/${projectId}/briefing`);

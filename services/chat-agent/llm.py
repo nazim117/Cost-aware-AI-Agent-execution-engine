@@ -1,4 +1,4 @@
-# llm.py — DeepSeek chat completions client.
+# DeepSeek chat completions client.
 #
 # DeepSeek's API is OpenAI-compatible: the request and response JSON shapes are
 # identical to OpenAI's /v1/chat/completions endpoint.  That means we can use any

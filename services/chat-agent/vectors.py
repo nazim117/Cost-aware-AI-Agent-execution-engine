@@ -14,7 +14,7 @@
 #   - -1.0 → opposite direction   → antonyms (rare in practice)
 #   In practice, scores above ~0.85 are very similar; below ~0.5 are unrelated.
 #
-# Data model (Step 5+):
+# Data model:
 #   Each stored "point" in Qdrant has three parts:
 #   - id:      a UUID string that uniquely identifies this point
 #   - vector:  the 768-float embedding of the text
@@ -133,8 +133,7 @@ class VectorStore:
     async def reset_collection(self, name: str, dim: int) -> None:
         """Drop and recreate a collection from scratch.
 
-        Called by startup code when schema_version mismatches.  Per the
-        Step 5 plan we wipe rather than migrate — an existing collection's
+        Called by startup code when schema_version mismatches. An existing collection's
         points have no project_id tag and would otherwise be invisible to
         every filtered search.
         """

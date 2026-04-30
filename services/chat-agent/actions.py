@@ -1,4 +1,4 @@
-# actions.py — human-in-the-loop action store for PM writes (Step 7).
+# human-in-the-loop action store for PM writes.
 #
 # Why a separate module?
 #   sync.py already owns the `actions` table as an audit log for sync events.
@@ -10,14 +10,7 @@
 #   The `actions` table is created by SyncStore.init() in sync.py.
 #   This module only reads/writes rows; it never creates or alters the table.
 #
-# Action lifecycle:
-#   create_pending() → pending
-#   pending → approve()         → approved
-#   approved → mark_executed()  → executed   (terminal)
-#   pending → reject()          → rejected   (terminal)
-#   any     → mark_failed()     → failed     (terminal, on integration error)
-#
-# Supported action types (Step 7 MVP):
+# Supported action types:
 #   "jira:add_comment"   — POST a comment on a Jira issue
 #   "github:add_comment" — POST a comment on a GitHub issue/PR
 #

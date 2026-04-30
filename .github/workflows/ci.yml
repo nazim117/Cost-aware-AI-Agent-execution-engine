@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module:
+          - services/agent-executor
+          - services/gateway
+          - services/mcp-server
+          - services/policy-engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.2"
+          cache: true
+
+      - name: Ensure go workspace
+        run: |
+          [ -f go.work ] || go work init \
+            ./services/agent-executor \
+            ./services/gateway \
+            ./services/mcp-server \
+            ./services/policy-engine
+
+      - name: go vet
+        run: go vet ./${{ matrix.module }}/...
+
+      - name: go test
+        run: go test -race ./${{ matrix.module }}/...
+
+  python-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/chat-agent/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r services/chat-agent/requirements.txt
+
+      - name: pytest
+        run: pytest -q
+        working-directory: services/chat-agent
+
+  dashboard-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: dashboard
+
+      - name: Lint
+        run: npm run lint
+        working-directory: dashboard
+
+      - name: Build
+        run: npm run build
+        working-directory: dashboard
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+          retention-days: 7
+
+  extension-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip extension
+        run: zip -r extension.zip extension/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrome-extension
+          path: extension.zip
+          retention-days: 7
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
