@@ -25,7 +25,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -50,6 +50,7 @@ from transcript import (
 )
 from vectors import VectorStore
 import briefing
+from extractors import extract_file, extract_url
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -278,6 +279,11 @@ class BriefingOut(BaseModel):
     recent_decisions: list[BriefDecisionOut]
     active_risks: list[BriefRiskOut]
     generated_at: str
+
+
+class SourceOut(BaseModel):
+    source: str   # Label supplied at ingest time (e.g. "notes.md", "jira:KAN-1").
+    chunks: int   # Number of Qdrant points stored under this source label.
 
 
 class MemoryHit(BaseModel):
@@ -592,45 +598,35 @@ async def post_ingest(req: IngestRequest) -> IngestResponse:
     return IngestResponse(chunks=n)
 
 
-@app.post("/ingest/transcript", response_model=IngestTranscriptResponse)
-async def post_ingest_transcript(
-    req: IngestTranscriptRequest,
+async def _process_transcript(
+    project_id: str, source: str, text: str
 ) -> IngestTranscriptResponse:
-    """Two-phase transcript ingest:
+    """Run the two-phase transcript pipeline and return the response model.
 
-    Phase 1 — chunk the raw text and store vectors in Qdrant (same as /ingest).
-              This makes the transcript searchable from /chat.
-    Phase 2 — send the full text to the LLM for structured extraction.
-              Decisions, action items, and risks are stored in SQLite tables
-              so they can be queried with exact filters (e.g. status=open).
-
-    Idempotent: re-posting the same `source` replaces prior content.
+    Shared by /ingest/transcript, /ingest/file?kind=transcript, and
+    /ingest/url?kind=transcript so they all behave identically.
     """
-    await _require_project(req.project_id)
-
     # Phase 1 — delete old vector chunks for this source, then re-ingest.
     await vstore.delete_by_source(
-        settings.qdrant_docs_collection, req.project_id, req.source
+        settings.qdrant_docs_collection, project_id, source
     )
-    chunk_count = await rag.ingest(req.project_id, req.source, req.text, vstore)
+    chunk_count = await rag.ingest(project_id, source, text, vstore)
 
     # Phase 2 — delete old structured rows, then re-extract.
-    await transcript_store.delete_by_source(req.project_id, req.source)
+    await transcript_store.delete_by_source(project_id, source)
     try:
-        extracted = await extract_structured(req.text, chat)
+        extracted = await extract_structured(text, chat)
     except ValueError as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Structured extraction failed: {exc}",
         ) from exc
 
-    counts = await transcript_store.save_extracted(
-        req.project_id, req.source, extracted
-    )
+    counts = await transcript_store.save_extracted(project_id, source, extracted)
     logger.info(
         "Transcript[%s] source=%r: %d chunks, %d decisions, %d action_items, %d risks",
-        req.project_id,
-        req.source,
+        project_id,
+        source,
         chunk_count,
         counts["decisions"],
         counts["action_items"],
@@ -641,6 +637,84 @@ async def post_ingest_transcript(
         decisions=counts["decisions"],
         action_items=counts["action_items"],
         risks=counts["risks"],
+    )
+
+
+@app.post("/ingest/transcript", response_model=IngestTranscriptResponse)
+async def post_ingest_transcript(
+    req: IngestTranscriptRequest,
+) -> IngestTranscriptResponse:
+    """Pasted-text transcript ingest. See _process_transcript for behaviour."""
+    await _require_project(req.project_id)
+    return await _process_transcript(req.project_id, req.source, req.text)
+
+
+@app.post("/ingest/file", response_model=IngestTranscriptResponse)
+async def post_ingest_file(
+    project_id: str = Form(...),
+    kind: str = Form("document"),
+    file: UploadFile = File(...),
+) -> IngestTranscriptResponse:
+    """Upload a file and ingest its extracted text.
+
+    Form fields:
+        project_id: Which project brain owns this content.
+        kind:       "document" (chunk + embed only) or "transcript"
+                    (also extract decisions / action items / risks).
+        file:       The uploaded file. Source label is the original filename.
+
+    Always returns IngestTranscriptResponse so the frontend gets a uniform
+    shape; for documents the decisions / action_items / risks fields are 0.
+    """
+    await _require_project(project_id)
+    if kind not in {"document", "transcript"}:
+        raise HTTPException(400, f"Invalid kind: {kind!r}")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    text = extract_file(file.filename or "uploaded", data)
+    source = file.filename or "uploaded-file"
+
+    if kind == "transcript":
+        return await _process_transcript(project_id, source, text)
+
+    chunks = await rag.ingest(project_id, source, text, vstore)
+    return IngestTranscriptResponse(
+        chunks=chunks, decisions=0, action_items=0, risks=0
+    )
+
+
+class IngestUrlRequest(BaseModel):
+    project_id: str
+    url: str
+    kind: str = "document"  # "document" or "transcript"
+
+
+@app.post("/ingest/url", response_model=IngestTranscriptResponse)
+async def post_ingest_url(req: IngestUrlRequest) -> IngestTranscriptResponse:
+    """Fetch and ingest content at a URL.
+
+    Routes by hostname:
+        youtube.com / youtu.be   → captions via youtube-transcript-api
+        *.wikipedia.org          → MediaWiki action API extract
+        anything else            → trafilatura main-content extraction
+    """
+    await _require_project(req.project_id)
+    if req.kind not in {"document", "transcript"}:
+        raise HTTPException(400, f"Invalid kind: {req.kind!r}")
+
+    source, text = extract_url(req.url)
+    if not text.strip():
+        raise HTTPException(400, f"No content extracted from {req.url!r}")
+
+    if req.kind == "transcript":
+        return await _process_transcript(req.project_id, source, text)
+
+    chunks = await rag.ingest(req.project_id, source, text, vstore)
+    return IngestTranscriptResponse(
+        chunks=chunks, decisions=0, action_items=0, risks=0
     )
 
 
@@ -730,6 +804,14 @@ async def get_briefing(project_id: str) -> BriefingOut:
         ],
         generated_at=b.generated_at,
     )
+
+
+@app.get("/projects/{project_id}/sources", response_model=list[SourceOut])
+async def list_sources(project_id: str) -> list[SourceOut]:
+    """Return distinct ingested sources for a project with their chunk counts."""
+    await _require_project(project_id)
+    summaries = await rag.list_sources(project_id=project_id, vstore=vstore)
+    return [SourceOut(source=s.source, chunks=s.chunks) for s in summaries]
 
 
 @app.post("/chat", response_model=ChatResponse)

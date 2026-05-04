@@ -251,6 +251,37 @@ class VectorStore:
                 detail=f"Qdrant delete_by_project failed: {exc}",
             ) from exc
 
+    async def scroll_payloads(
+        self, collection: str, project_id: str
+    ) -> list[dict]:
+        """Return all payload dicts for a project by scrolling without a query vector.
+
+        Used by rag.list_sources to count distinct sources without embedding a query.
+        Pages through the collection until Qdrant returns next_offset=None.
+        """
+        payloads: list[dict] = []
+        offset = None
+        try:
+            while True:
+                results, next_offset = await self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=_project_filter(project_id),
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=100,
+                    offset=offset,
+                )
+                payloads.extend(r.payload for r in results)
+                if next_offset is None:
+                    break
+                offset = next_offset
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Qdrant scroll failed: {exc}",
+            ) from exc
+        return payloads
+
     async def delete_by_source(
         self, collection: str, project_id: str, source: str
     ) -> None:
