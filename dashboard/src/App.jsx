@@ -208,7 +208,7 @@ function DropZone({ busy, url, setUrl, onFile, onUrl }) {
 
   return (
     <div className="section">
-      <div className="section-title">↑ Add to Brain</div>
+      <div className="section-title">↑ Add sources</div>
 
       <div
         className={`dropzone ${hover ? 'hover' : ''} ${busy ? 'busy' : ''}`}

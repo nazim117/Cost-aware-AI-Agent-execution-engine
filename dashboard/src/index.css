@@ -90,6 +90,7 @@ body { background: var(--bg-base); color: var(--text); }
 }
 .project-select:focus { border-color: var(--accent); }
 
+
 .topbar-actions { display: flex; align-items: center; gap: 4px; margin-left: 4px; }
 
 /* ─── Left pane ───────────────────────────────────────────── */

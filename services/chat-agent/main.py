@@ -18,7 +18,7 @@
 #   embeddings.py — turn text into a 768-float vector via Ollama
 #   vectors.py    — store and search vectors in Qdrant, always filtered by project_id
 #   rag.py        — chunk + ingest documents; retrieve relevant chunks (per project)
-#   llm.py        — send a message list to DeepSeek, get a reply
+#   llm.py        — send a message list to the configured LLM backend, get a reply
 
 import json
 import logging
@@ -36,7 +36,7 @@ from config import settings
 from embeddings import embed
 from integrations.github import GitHubIntegration
 from integrations.jira import JiraIntegration
-from llm import chat
+from llm import chat, validate_llm_config
 from memory import ConversationStore
 from projects import SCHEMA_VERSION, Project, ProjectStore
 import rag
@@ -133,6 +133,10 @@ async def lifespan(app: FastAPI):
     # schema coupling to the version wipe above.
     await sync_store.init()
     await transcript_store.init()
+
+    # Fail fast if the LLM configuration is incomplete — better to refuse to
+    # start than to discover a missing API key on the first real user request.
+    validate_llm_config()
 
     yield
     # Shutdown: no explicit cleanup needed for either store.
@@ -1002,7 +1006,7 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     )
     logger.debug("LLM full messages: %s", messages)
 
-    # 6. Call DeepSeek.
+    # 6. Call the LLM (backend and model fixed by deploy-time config).
     reply = await chat(messages)
 
     # Post-process the reply: extract <<DRAFT_ACTION>>{...}<<END>> if present.
