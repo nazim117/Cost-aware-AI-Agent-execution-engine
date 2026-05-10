@@ -53,6 +53,12 @@ const actionsBadge    = document.getElementById("actions-badge");
 const actionsPanel    = document.getElementById("actions-panel");
 const actionsList     = document.getElementById("actions-list");
 const transcript      = document.getElementById("transcript");
+const transcriptBtn   = document.getElementById("transcript-btn");
+const transcriptModal = document.getElementById("transcript-modal");
+const transcriptSource = document.getElementById("transcript-source");
+const transcriptText = document.getElementById("transcript-text");
+const transcriptCancel = document.getElementById("transcript-cancel");
+const transcriptSubmit = document.getElementById("transcript-submit");
 const statusEl        = document.getElementById("status");
 const inputEl         = document.getElementById("input");
 const sendBtn         = document.getElementById("send-btn");
@@ -70,6 +76,26 @@ function appendBubble(role, text) {
   transcript.scrollTop = transcript.scrollHeight;
 }
 
+function appendCitations(citations) {
+  const details = document.createElement("details");
+  details.className = "sources-panel";
+
+  const summary = document.createElement("summary");
+  summary.textContent = `Sources (${citations.length})`;
+  details.appendChild(summary);
+
+  const ul = document.createElement("ul");
+  ul.className = "sources-list";
+  for (const c of citations) {
+    const li = document.createElement("li");
+    li.textContent = `[${c.ref}] ${c.source} · chunk ${c.chunk_index}`;
+    ul.appendChild(li);
+  }
+  details.appendChild(ul);
+  transcript.appendChild(details);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
 function clearTranscript() {
   transcript.innerHTML = "";
 }
@@ -77,6 +103,7 @@ function clearTranscript() {
 function setBusy(busy) {
   sendBtn.disabled          = busy;
   usePageBtn.disabled       = busy;
+  transcriptBtn.disabled    = busy;
   inputEl.disabled          = busy;
   projectSelect.disabled    = busy;
   newProjectBtn.disabled    = busy;
@@ -194,6 +221,7 @@ async function selectProject(projectId) {
   settingsBtn.disabled      = !projectId;
   syncBtn.disabled          = !projectId;
   actionsBtn.disabled       = !projectId;
+  transcriptBtn.disabled    = !projectId;
   if (projectId) {
     setStatus("");
     loadPendingActions(projectId);
@@ -211,6 +239,39 @@ async function sendMessage() {
   if (!message) return;
   if (!currentProjectId) {
     setStatus("⚠ Create or select a project first.");
+    return;
+  }
+
+  // Handle /briefing slash command (Step 11)
+  if (message === "/briefing") {
+    inputEl.value = "";
+    setBusy(true);
+    setStatus("Loading briefing…");
+    try {
+      const response = await fetch(`${AGENT_URL}/projects/${currentProjectId}/briefing`);
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
+      const b = await response.json();
+      appendBubble("assistant", `📋 **Project Briefing**\n\n${b.summary}`);
+      if (b.open_actions.length > 0) {
+        const actionsList = b.open_actions.map(a => `• ${a.text}${a.owner ? ` (@${a.owner})` : ''}${a.due_date ? ` due ${a.due_date}` : ''}`).join('\n');
+        appendBubble("assistant", `**Open Actions:**\n${actionsList}`);
+      }
+      if (b.recent_decisions.length > 0) {
+        const decisionsList = b.recent_decisions.map(d => `• ${d.text}`).join('\n');
+        appendBubble("assistant", `**Recent Decisions:**\n${decisionsList}`);
+      }
+      if (b.active_risks.length > 0) {
+        const risksList = b.active_risks.map(r => `• ${r.text}`).join('\n');
+        appendBubble("assistant", `**Active Risks:**\n${risksList}`);
+      }
+      setStatus("");
+    } catch (err) {
+      appendBubble("assistant", `⚠ Briefing failed: ${err.message}`);
+      setStatus("Make sure the chat-agent server is running on port 8084.");
+    } finally {
+      setBusy(false);
+      inputEl.focus();
+    }
     return;
   }
 
@@ -238,6 +299,9 @@ async function sendMessage() {
 
     const data = await response.json();
     appendBubble("assistant", data.reply);
+    if (data.citations && data.citations.length > 0) {
+      appendCitations(data.citations);
+    }
     setStatus("");
     // Refresh the pending-actions badge — the LLM may have drafted a new action.
     loadPendingActions(currentProjectId);
@@ -576,6 +640,62 @@ actionsBtn.addEventListener("click", toggleActionsPanel);
 projectSelect.addEventListener("change", (e) => {
   selectProject(e.target.value);
 });
+
+// ---------------------------------------------------------------------------
+// Transcript modal (Step 10)
+// ---------------------------------------------------------------------------
+function toggleTranscriptModal() {
+  transcriptModal.classList.toggle("visible");
+  if (transcriptModal.classList.contains("visible")) {
+    transcriptSource.value = "";
+    transcriptText.value = "";
+    transcriptSource.focus();
+  }
+}
+
+async function handleTranscriptSubmit() {
+  const source = transcriptSource.value.trim();
+  const text = transcriptText.value.trim();
+  if (!source || !text) {
+    setStatus("Please fill in both source and text.");
+    return;
+  }
+  if (!currentProjectId) {
+    setStatus("Select a project first.");
+    return;
+  }
+
+  setBusy(true);
+  setStatus("Processing transcript…");
+  toggleTranscriptModal();
+
+  try {
+    const response = await fetch(`${AGENT_URL}/ingest/transcript`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: currentProjectId,
+        source,
+        text,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Server returned ${response.status}`);
+    }
+
+    const data = await response.json();
+    setStatus(`✓ Processed — ${data.decisions} decisions, ${data.action_items} actions, ${data.risks} risks`);
+  } catch (err) {
+    setStatus(`⚠ Process failed: ${err.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+transcriptBtn.addEventListener("click", toggleTranscriptModal);
+transcriptCancel.addEventListener("click", toggleTranscriptModal);
+transcriptSubmit.addEventListener("click", handleTranscriptSubmit);
 
 // ---------------------------------------------------------------------------
 // Initialise — run once when the side panel loads

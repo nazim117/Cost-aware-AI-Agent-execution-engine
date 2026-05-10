@@ -35,4 +35,42 @@ export const listActions = (projectId, status) => {
 };
 export const approveAction = (actionId) => request('POST', `/actions/${actionId}/approve`);
 export const rejectAction = (actionId) => request('POST', `/actions/${actionId}/reject`);
-export const retryAction = (actionId) => request('POST', `/actions/${actionId}/retry`);
+
+// Step 10: Transcript processing
+export const ingestTranscript = (projectId, source, text) =>
+  request('POST', '/ingest/transcript', { project_id: projectId, source, text });
+
+export const listDecisions = (projectId) =>
+  request('GET', `/projects/${projectId}/decisions`);
+
+export const listActionItems = (projectId, status) => {
+  const qs = status ? `?status=${status}` : '';
+  return request('GET', `/projects/${projectId}/action-items${qs}`);
+};
+
+export const listRisks = (projectId) =>
+  request('GET', `/projects/${projectId}/risks`);
+
+// Step 11: Project briefing
+export const getBriefing = (projectId) =>
+  request('GET', `/projects/${projectId}/briefing`);
+
+export const listSources = (projectId) =>
+  request('GET', `/projects/${projectId}/sources`);
+
+// File upload (multipart) — kind is "document" or "transcript".
+export async function ingestFile(projectId, file, kind) {
+  const fd = new FormData();
+  fd.append('project_id', projectId);
+  fd.append('kind', kind);
+  fd.append('file', file);
+  const res = await fetch(BASE + '/ingest/file', { method: 'POST', body: fd });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${text}`);
+  }
+  return res.json();
+}
+
+export const ingestUrl = (projectId, url, kind) =>
+  request('POST', '/ingest/url', { project_id: projectId, url, kind });

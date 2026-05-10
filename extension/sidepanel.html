@@ -110,6 +110,16 @@
       border-bottom-left-radius: 3px;
     }
 
+    /* ── Sources panel (Step 9 citations) ── */
+    .sources-panel {
+      font-size: 11px; color: #888; margin: 2px 8px 4px;
+      align-self: flex-start;
+    }
+    .sources-panel summary { cursor: pointer; color: #555; }
+    .sources-panel summary:hover { color: #1a73e8; }
+    .sources-list { margin: 4px 0 0 0; padding-left: 14px; list-style: none; }
+    .sources-list li { padding: 1px 0; font-family: monospace; font-size: 10.5px; }
+
     /* ── Status bar ── */
     #status {
       padding: 4px 16px;
@@ -320,6 +330,25 @@
     }
 
     #actions-badge.hidden { display: none; }
+
+    /* ── Transcript modal (Step 10) ── */
+    #transcript-modal {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5); display: none;
+      align-items: center; justify-content: center; z-index: 100;
+    }
+    #transcript-modal.visible { display: flex; }
+    #transcript-modal-content {
+      background: #fff; border-radius: 12px; padding: 16px;
+      width: 90%; max-width: 400px; display: flex; flex-direction: column; gap: 10px;
+    }
+    #transcript-modal-content h3 { font-size: 15px; margin-bottom: 4px; }
+    #transcript-modal-content input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+    #transcript-modal-content textarea { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; resize: vertical; min-height: 150px; }
+    #transcript-modal-content .btns { display: flex; gap: 8px; justify-content: flex-end; }
+    #transcript-modal-content button { padding: 6px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+    #transcript-modal-content .btn-primary { background: #1a1a2e; color: #fff; border: none; }
+    #transcript-modal-content .btn-secondary { background: #fff; color: #555; border: 1px solid #ccc; }
   </style>
 </head>
 <body>
@@ -360,10 +389,24 @@
   <div id="status"></div>
 
   <button id="use-page-btn">📄 Use current page as context</button>
+  <button id="transcript-btn" class="icon-btn" style="margin: 0 16px 8px; width: calc(100% - 32px);" title="Ingest meeting transcript">📝 Ingest transcript</button>
 
   <div id="input-row">
     <input id="input" type="text" placeholder="Ask anything…" autocomplete="off" />
     <button id="send-btn">Send</button>
+  </div>
+
+  <!-- Transcript modal (Step 10) -->
+  <div id="transcript-modal">
+    <div id="transcript-modal-content">
+      <h3>📝 Ingest Transcript</h3>
+      <input id="transcript-source" type="text" placeholder="Source (e.g. meeting-2026-04-27)" />
+      <textarea id="transcript-text" placeholder="Paste meeting transcript here..."></textarea>
+      <div class="btns">
+        <button id="transcript-cancel" class="btn-secondary">Cancel</button>
+        <button id="transcript-submit" class="btn-primary">Process</button>
+      </div>
+    </div>
   </div>
 
   <script src="sidepanel.js"></script>

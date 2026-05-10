@@ -1,4 +1,4 @@
-# embeddings.py — local embedding model client via Ollama.
+# local embedding model client via Ollama.
 #
 # What is an embedding?
 #   An embedding is a fixed-length list of numbers (a "vector") that represents

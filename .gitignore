@@ -20,9 +20,9 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# Go workspace file
-go.work
-go.work.sum
+# Go workspace file — tracked so CI can use it without reconstruction
+# go.work
+# go.work.sum
 
 # env file
 .env
@@ -44,6 +44,8 @@ config/secrets.yml
 *.key
 # Ignore JSON files that may contain sensitive data
 *.json
+# Allow the detect-secrets baseline (it's a JSON file, not a secret)
+!.secrets.baseline
 # Other common sensitive files
 *.pem
 *.crt

@@ -1,4 +1,4 @@
-# rag.py — RAG (Retrieval-Augmented Generation) ingest and retrieve pipeline.
+# RAG (Retrieval-Augmented Generation) ingest and retrieve pipeline.
 #
 # What is RAG?
 #   RAG is a pattern for giving an LLM access to private knowledge it was not
@@ -41,6 +41,13 @@ logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
+class SourceSummary:
+    """Distinct source label with chunk count — returned by list_sources."""
+    source: str
+    chunks: int
+
+
+@dataclass
 class Chunk:
     """One retrieved document chunk from the RAG pipeline."""
     score: float        # cosine similarity to the query (higher = more relevant)
@@ -70,7 +77,7 @@ def chunk_text(text: str, size: int = 500, overlap: int = 50) -> list[str]:
 
     chunks = []
     start = 0
-    step = size - overlap  # how far to advance the window each iteration
+    step = size - overlap
 
     while start < len(text):
         chunks.append(text[start : start + size])
@@ -125,6 +132,26 @@ async def ingest(
     return len(chunks)
 
 
+async def list_sources(
+    project_id: str,
+    vstore: VectorStore,
+) -> list[SourceSummary]:
+    """Return distinct sources ingested into a project, with their chunk counts.
+
+    Scrolls the documents collection without a query vector, so no embedding
+    cost. Aggregates by payload.source — the label supplied at ingest time.
+    """
+    payloads = await vstore.scroll_payloads(
+        collection=settings.qdrant_docs_collection,
+        project_id=project_id,
+    )
+    counts: dict[str, int] = {}
+    for p in payloads:
+        src = p.get("source", "")
+        counts[src] = counts.get(src, 0) + 1
+    return [SourceSummary(source=s, chunks=c) for s, c in sorted(counts.items())]
+
+
 async def retrieve(
     project_id: str,
     query: str,
@@ -136,8 +163,7 @@ async def retrieve(
 
     Args:
         project_id: Only chunks tagged with this id are considered.  Chunks
-                    from other projects are invisible — the whole point of
-                    Step 5's isolation.
+                    from other projects are invisible.
         query:      The search string — usually the user's current message.
         k:          How many chunks to return.
         vstore:     The VectorStore instance to search.

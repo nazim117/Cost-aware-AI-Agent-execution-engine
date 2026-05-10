@@ -1,27 +1,9 @@
-# sync.py — PM sync orchestrator.
-#
-# This module owns two SQLite tables:
-#
-#   sync_state
-#   ├── project_id     TEXT   }  composite PK — one row per (project, ref)
-#   ├── ref_key        TEXT   }
-#   ├── ref_value      TEXT   }
-#   └── last_synced_at TEXT      ISO-8601; NULL on first sync
-#
-#   actions
-#   ├── id           TEXT PK   UUID
-#   ├── project_id   TEXT
-#   ├── action       TEXT      e.g. "sync"
-#   ├── status       TEXT      "done" | "failed"
-#   ├── payload      TEXT      JSON — item counts, ref details
-#   ├── created_at   TEXT
-#   └── completed_at TEXT
-#
+# PM sync orchestrator.
+
 # Why two tables?
 #   sync_state answers "when did we last sync ref X?" — looked up before each
 #   fetch so we only pull items that changed.
-#   actions is an append-only audit log — Step 7 will use it to record
-#   proposed writes before a human approves them.  Having it now means the
+#   actions is an append-only audit log.  Having it now means the
 #   schema is ready and the log starts filling from day one.
 #
 # Why is sync logic here and not in main.py?
