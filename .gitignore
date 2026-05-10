@@ -29,6 +29,8 @@ go.work.sum
 services/gateway/.env
 services/agent-executor/.env
 
+services/chat-agent/venv/
+
 # Audit logs produced by the gateway at runtime
 *.jsonl
 
