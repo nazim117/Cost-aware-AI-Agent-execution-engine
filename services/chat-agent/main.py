@@ -1,0 +1,814 @@
+# main.py — FastAPI application entry point.
+#
+# This file does three things:
+#   1. Defines the app lifespan (startup / shutdown hooks + schema checks).
+#   2. Declares the Pydantic request/response models for the endpoints.
+#   3. Registers the route handlers: /health, /projects (CRUD), /chat,
+#      /ingest, /memory/search.
+#
+# Data flow for POST /chat (Step 5 version):
+#   config → projects (validate) → memory (SQLite, scoped by project_id)
+#          → embeddings (Ollama) → vectors (Qdrant, filtered by project_id)
+#          → rag (document retrieval, scoped by project_id) → llm (DeepSeek)
+#
+# Each module has one responsibility:
+#   config.py     — read env vars once at startup
+#   projects.py   — SQLite project store (Step 5+)
+#   memory.py     — SQLite conversation store (recent history, per project)
+#   embeddings.py — turn text into a 768-float vector via Ollama
+#   vectors.py    — store and search vectors in Qdrant, always filtered by project_id
+#   rag.py        — chunk + ingest documents; retrieve relevant chunks (per project)
+#   llm.py        — send a message list to DeepSeek, get a reply
+
+import json
+import logging
+import re
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+import httpx
+
+from actions import ActionStore, Action, execute_action, VALID_ACTION_TYPES
+from config import settings
+from embeddings import embed
+from integrations.github import GitHubIntegration
+from integrations.jira import JiraIntegration
+from llm import chat
+from memory import ConversationStore
+from projects import SCHEMA_VERSION, Project, ProjectStore
+import rag
+from sync import SyncStore, sync_project
+from vectors import VectorStore
+
+# Use uvicorn's own logger so our INFO messages appear alongside uvicorn's
+# access log output.  This works whether running via uvicorn CLI or docker.
+logger = logging.getLogger("uvicorn.error")
+
+# ---------------------------------------------------------------------------
+# Shared state — one instance of each store for the whole process.
+# ---------------------------------------------------------------------------
+project_store = ProjectStore(settings.sqlite_path)
+store = ConversationStore(settings.sqlite_path)
+vstore = VectorStore(url=settings.qdrant_url)
+sync_store = SyncStore(settings.sqlite_path)
+action_store = ActionStore(settings.sqlite_path)
+
+# Build the integrations registry at startup — only include adapters whose
+# required credentials are present in the environment.  Unconfigured adapters
+# are skipped silently; the sync endpoint logs a warning if a project's
+# external_refs reference a key that has no matching integration.
+_integrations: dict = {}
+if settings.jira_base_url and settings.jira_email and settings.jira_api_token:
+    _integrations["jira_project_key"] = JiraIntegration(
+        base_url=settings.jira_base_url,
+        email=settings.jira_email,
+        api_token=settings.jira_api_token,
+    )
+if settings.github_token:
+    _integrations["github_repo"] = GitHubIntegration(token=settings.github_token)
+
+# nomic-embed-text always produces 768-dimensional vectors.
+# This must match the dimension used when the Qdrant collections were created.
+EMBED_DIM = 768
+
+# ---------------------------------------------------------------------------
+# Refusal filter — prevent prior LLM refusals from poisoning later prompts.
+# ---------------------------------------------------------------------------
+_REFUSAL_MARKERS = (
+    "i do not have access",
+    "i don't have access",
+    "i cannot see",
+    "i can't see",
+    "i cannot access",
+    "i can't access",
+    "no access to your",
+    "i'm unable to access",
+    "i am unable to access",
+)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _REFUSAL_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan — startup initialisation + one-time schema wipe.
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure the projects + schema_version tables exist BEFORE we check the
+    # version — otherwise current_version() would fail on a blank DB.
+    await project_store.init()
+
+    previous_version = await project_store.current_version()
+    schema_mismatch = previous_version != SCHEMA_VERSION
+
+    if schema_mismatch:
+        # Step 5 decision: wipe rather than migrate.  This runs once when
+        # upgrading from a pre-Step-5 DB (previous_version is None) and again
+        # any future time we bump SCHEMA_VERSION.  Loud log line on purpose.
+        logger.warning(
+            "Schema version mismatch (stored=%r, code=%r) — wiping messages "
+            "and Qdrant collections.  Project rows are preserved.",
+            previous_version,
+            SCHEMA_VERSION,
+        )
+        await store.reset()
+        await vstore.reset_collection(settings.qdrant_collection, dim=EMBED_DIM)
+        await vstore.reset_collection(settings.qdrant_docs_collection, dim=EMBED_DIM)
+        await project_store.set_version(SCHEMA_VERSION)
+    else:
+        # Normal boot: just make sure everything is in place.  Idempotent.
+        await store.init()
+        await vstore.ensure_collection(settings.qdrant_collection, dim=EMBED_DIM)
+        await vstore.ensure_collection(settings.qdrant_docs_collection, dim=EMBED_DIM)
+
+    # SyncStore tables are always safe to create — no schema coupling to the
+    # version wipe above.
+    await sync_store.init()
+
+    yield
+    # Shutdown: no explicit cleanup needed for either store.
+
+
+app = FastAPI(title="chat-agent", lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# CORS — allow the Chrome extension (and any localhost origin) to call this API.
+#
+# Why allow_origins=["*"]?
+#   Chrome extension IDs look like chrome-extension://abcdef123456...  The ID
+#   changes every time an unpacked extension is reloaded in developer mode, so
+#   we cannot hard-code it.  Since this server only listens on localhost and is
+#   never exposed to the internet, allowing all origins is safe.
+# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+# --- Project CRUD models ---------------------------------------------------
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Human-readable project name.")
+    # Optional bag of external references (Jira key, GitHub repo, ...).
+    # Reserved in Step 5; populated by Step 6 integrations.
+    external_refs: dict = Field(default_factory=dict)
+
+
+class ProjectUpdateRequest(BaseModel):
+    # Both fields optional — callers send only what they want to change.
+    name: str | None = None
+    external_refs: dict | None = None
+
+
+class ProjectOut(BaseModel):
+    id: str
+    name: str
+    created_at: str
+    external_refs: dict
+
+
+def _project_to_out(p: Project) -> ProjectOut:
+    """Small helper — turning dataclass into pydantic one place."""
+    return ProjectOut(
+        id=p.id,
+        name=p.name,
+        created_at=p.created_at,
+        external_refs=p.external_refs,
+    )
+
+
+# --- Chat / ingest models (all now require project_id) --------------------
+class ChatRequest(BaseModel):
+    project_id: str   # Which project brain owns this conversation.
+    session_id: str   # Identifies which conversation inside the project.
+    message: str      # The user's input text.
+
+
+class ChatResponse(BaseModel):
+    reply: str        # The assistant's reply text.
+
+
+class IngestRequest(BaseModel):
+    project_id: str   # Which project brain to add this document to.
+    source: str       # A label for the document — filename, URL, or any identifier.
+    text: str         # The full document text to index.
+
+
+class IngestResponse(BaseModel):
+    chunks: int       # How many chunks were stored in Qdrant.
+
+
+class MemoryHit(BaseModel):
+    score: float      # Cosine similarity (0–1, higher = more similar).
+    role: str         # 'user' or 'assistant'.
+    content: str      # The original message text.
+    session_id: str   # Which conversation the hit came from.
+
+
+# --- Pending-action models (Step 7) ----------------------------------------
+class ProposeActionRequest(BaseModel):
+    action_type: str  # Must be in VALID_ACTION_TYPES.
+    payload: dict     # {"item_id": "...", "body": "...", "ref_key": "..."}
+
+
+class ActionOut(BaseModel):
+    id: str
+    project_id: str
+    action_type: str
+    status: str
+    payload: dict
+    created_at: str
+    completed_at: str | None
+
+
+def _action_to_out(a: Action) -> ActionOut:
+    return ActionOut(
+        id=a.id,
+        project_id=a.project_id,
+        action_type=a.action_type,
+        status=a.status,
+        payload=a.payload,
+        created_at=a.created_at,
+        completed_at=a.completed_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+async def _require_project(project_id: str) -> Project:
+    """Return the project, or raise 404.
+
+    Every scoped endpoint starts by calling this so "unknown project" fails
+    loudly rather than silently returning empty results.
+    """
+    project = await project_store.get(project_id)
+    if project is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Project {project_id!r} not found.",
+        )
+    return project
+
+
+# ---------------------------------------------------------------------------
+# Routes — liveness
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    """Liveness check.  Returns 200 OK when the service is running."""
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — project CRUD
+# ---------------------------------------------------------------------------
+@app.post("/projects", response_model=ProjectOut)
+async def post_projects(req: ProjectCreateRequest) -> ProjectOut:
+    """Create a new project brain.
+
+    The returned id is a UUID string — stable, safe to use in URLs/JSON.
+    """
+    try:
+        project = await project_store.create(
+            name=req.name,
+            external_refs=req.external_refs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    logger.info("Created project %r (%s)", project.name, project.id)
+    return _project_to_out(project)
+
+
+@app.get("/projects", response_model=list[ProjectOut])
+async def get_projects() -> list[ProjectOut]:
+    """List all projects, newest first."""
+    projects = await project_store.list()
+    return [_project_to_out(p) for p in projects]
+
+
+@app.patch("/projects/{project_id}", response_model=ProjectOut)
+async def patch_project(project_id: str, req: ProjectUpdateRequest) -> ProjectOut:
+    """Partial update — change name and/or external_refs.
+
+    Step 6 uses this to attach a Jira project key or GitHub repo to a brain.
+    """
+    try:
+        updated = await project_store.update(
+            project_id,
+            name=req.name,
+            external_refs=req.external_refs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found.")
+    return _project_to_out(updated)
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Delete a project and cascade through all of its state.
+
+    Cascade:
+      - SQLite:  projects row + messages rows   (ProjectStore.delete)
+      - Qdrant:  conversations + documents points tagged with project_id
+    """
+    # Do the vector deletes first.  If ProjectStore.delete() succeeded but the
+    # Qdrant delete failed, we'd be left with orphan vectors filtered on a
+    # project id that no longer exists — confusing but not dangerous.  Doing
+    # Qdrant first means a failure there prevents the SQLite delete, and the
+    # user can retry.
+    await vstore.delete_by_project(settings.qdrant_collection, project_id)
+    await vstore.delete_by_project(settings.qdrant_docs_collection, project_id)
+    await sync_store.delete_by_project(project_id)
+    # action_store.delete_by_project is also safe to call here even though
+    # sync_store already deleted the same rows — the second DELETE is a no-op.
+    await action_store.delete_by_project(project_id)
+
+    deleted = await project_store.delete(project_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found.")
+
+    logger.info("Deleted project %s and all of its memory.", project_id)
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Routes — PM sync (Step 6)
+# ---------------------------------------------------------------------------
+
+@app.post("/projects/{project_id}/sync")
+async def post_sync(project_id: str):
+    """Fetch items from all configured PM integrations for this project and
+    ingest them into the project's RAG document store.
+
+    Idempotent: items already ingested are overwritten with the same content,
+    so re-running sync does not grow the vector store unboundedly.  The
+    last_synced_at timestamp per external ref means only items updated since
+    the last sync are fetched on subsequent runs (incremental).
+
+    Requires the project to have at least one entry in external_refs whose
+    key matches a configured integration (jira_project_key or github_repo).
+    The matching credentials must be set as environment variables:
+      Jira:   JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN
+      GitHub: GITHUB_TOKEN
+    """
+    project = await _require_project(project_id)
+
+    if not project.external_refs:
+        raise HTTPException(
+            status_code=400,
+            detail="Project has no external_refs — attach a jira_project_key or github_repo first.",
+        )
+
+    try:
+        results = await sync_project(
+            project_id=project_id,
+            external_refs=project.external_refs,
+            sync_store=sync_store,
+            vstore=vstore,
+            integrations=_integrations,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"PM API returned {exc.response.status_code}: {exc.response.text[:200]}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not reach PM API: {exc}",
+        ) from exc
+
+    return {
+        "synced_items": sum(r.items_fetched for r in results),
+        "chunks_stored": sum(r.chunks_stored for r in results),
+        "details": [
+            {
+                "ref_key": r.ref_key,
+                "ref_value": r.ref_value,
+                "items": r.items_fetched,
+                "chunks": r.chunks_stored,
+            }
+            for r in results
+        ],
+    }
+
+
+@app.get("/projects/{project_id}/sync")
+async def get_sync_status(project_id: str):
+    """Return the last-synced timestamp per external ref for this project.
+
+    Useful for displaying sync status in the UI without triggering a sync.
+    Returns an empty refs list if the project has never been synced.
+    """
+    await _require_project(project_id)
+    status = await sync_store.get_sync_status(project_id)
+    return {"refs": status}
+
+
+# ---------------------------------------------------------------------------
+# Routes — pending actions (Step 7)
+# ---------------------------------------------------------------------------
+
+@app.post("/projects/{project_id}/actions", response_model=ActionOut)
+async def propose_action(project_id: str, req: ProposeActionRequest) -> ActionOut:
+    """Create a pending action for human approval.
+
+    The agent (via the DRAFT_ACTION chat post-processor) or a human in the
+    extension form calls this endpoint.  Nothing is written to Jira/GitHub
+    until /actions/{id}/approve is called.
+    """
+    await _require_project(project_id)
+    if req.action_type not in VALID_ACTION_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown action_type {req.action_type!r}. "
+                   f"Allowed: {sorted(VALID_ACTION_TYPES)}",
+        )
+    for field in ("item_id", "body", "ref_key"):
+        if not req.payload.get(field):
+            raise HTTPException(
+                status_code=400,
+                detail=f"payload must include non-empty '{field}'",
+            )
+    action_id = await action_store.create_pending(
+        project_id, req.action_type, req.payload
+    )
+    action = await action_store.get(action_id)
+    return _action_to_out(action)
+
+
+@app.get("/projects/{project_id}/actions", response_model=list[ActionOut])
+async def list_actions(
+    project_id: str,
+    status: str | None = Query(None, description="Filter by status (e.g. 'pending')."),
+) -> list[ActionOut]:
+    """List actions for a project, newest first. Pass ?status=pending to filter."""
+    await _require_project(project_id)
+    actions = await action_store.list_for_project(project_id, status=status)
+    return [_action_to_out(a) for a in actions]
+
+
+@app.post("/actions/{action_id}/approve")
+async def approve_action(action_id: str):
+    """Approve a pending action and execute it immediately.
+
+    On success: returns {status: "executed", result: {id, url, created_at}}.
+    On integration failure: marks the action as 'failed' and returns 502.
+    """
+    action = await action_store.get(action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail=f"Action {action_id!r} not found.")
+    if action.status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Action {action_id!r} is {action.status!r}, not 'pending'.",
+        )
+
+    await action_store.approve(action_id)
+    # Re-fetch with updated status so execute_action sees it correctly.
+    action = await action_store.get(action_id)
+
+    try:
+        result = await execute_action(action, _integrations, project_store)
+    except Exception as exc:
+        error_msg = str(exc)
+        await action_store.mark_failed(action_id, error_msg)
+        logger.error("Action %s failed: %s", action_id, error_msg)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Integration call failed: {error_msg}",
+        ) from exc
+
+    await action_store.mark_executed(action_id, result)
+    logger.info("Action %s executed: %s", action_id, result.get("url", ""))
+    return {"status": "executed", "result": result}
+
+
+@app.post("/actions/{action_id}/reject")
+async def reject_action(action_id: str):
+    """Reject a pending action. No write is made to the PM system."""
+    action = await action_store.get(action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail=f"Action {action_id!r} not found.")
+    try:
+        await action_store.reject(action_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "rejected"}
+
+
+@app.post("/actions/{action_id}/retry")
+async def retry_action(action_id: str):
+    """Reset a failed action back to pending so it can be approved again."""
+    action = await action_store.get(action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail=f"Action {action_id!r} not found.")
+    try:
+        await action_store.reset_to_pending(action_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "pending"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — chat + ingest + memory search (now project-scoped)
+# ---------------------------------------------------------------------------
+@app.post("/ingest", response_model=IngestResponse)
+async def post_ingest(req: IngestRequest) -> IngestResponse:
+    """Split a document into chunks, embed them, and store them in Qdrant
+    under the given project.
+
+    Args (JSON body):
+        project_id: Which project brain owns this document.
+        source:     A label for this document (e.g. a filename or URL).
+        text:       The full document text.
+
+    Returns:
+        {"chunks": N} — the number of chunks stored.
+    """
+    await _require_project(req.project_id)
+    n = await rag.ingest(req.project_id, req.source, req.text, vstore)
+    return IngestResponse(chunks=n)
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def post_chat(req: ChatRequest) -> ChatResponse:
+    """Accept a user message, retrieve scoped memory + documents, call DeepSeek.
+
+    Full flow (everything scoped by project_id):
+        1.  Load the last 6 messages for (project, session) from SQLite.
+        2.  Persist the new user message to SQLite.
+        3.  Embed the user message; search Qdrant conversations within
+            the project for similar past messages.
+        3b. Search Qdrant documents within the project for relevant chunks.
+        4.  Upsert the user message vector into the conversations collection
+            (tagged with project_id).
+        5.  Build the prompt from document chunks, memory hits, recent history.
+        6.  Call DeepSeek.
+        7.  Persist the assistant reply to SQLite (tagged with project_id).
+        8.  Upsert the assistant reply vector into conversations (tagged).
+        9.  Return the reply.
+    """
+    await _require_project(req.project_id)
+
+    # 1. Recent history (last 6 messages = 3 turns, oldest first).
+    recent = await store.history(req.project_id, req.session_id, limit=6)
+
+    # 2. Persist the user message to SQLite immediately.
+    await store.append(req.project_id, req.session_id, "user", req.message)
+
+    # 3. Embed + search conversations collection for similar past messages,
+    #    filtered to this project only.
+    query_vec = await embed(req.message)
+    hits = await vstore.search(
+        settings.qdrant_collection,
+        project_id=req.project_id,
+        vector=query_vec,
+        k=settings.memory_search_k,
+    )
+
+    # 3b. Search documents collection for relevant chunks (RAG), same filter.
+    doc_chunks = await rag.retrieve(req.project_id, req.message, k=3, vstore=vstore)
+    logger.info(
+        "RAG[%s]: retrieved %d doc chunks for query %r: %s",
+        req.project_id,
+        len(doc_chunks),
+        req.message,
+        [(c.source, c.chunk_index) for c in doc_chunks],
+    )
+
+    # 4. Store the user message vector in Qdrant conversations.
+    await vstore.upsert(
+        settings.qdrant_collection,
+        project_id=req.project_id,
+        vector=query_vec,
+        payload={"session_id": req.session_id, "role": "user", "content": req.message},
+    )
+
+    # 5. Build the prompt.
+    #
+    # Deduplication for conversation hits: drop any hit already in recent history.
+    # Also strip prior assistant refusals — when the model has previously claimed
+    # "no access", those replies poison the next prompt by priming the model to
+    # repeat its own pattern.  We drop them here so the updated system message
+    # and retrieved chunks get a clean slate.
+    recent_contents = {m["content"] for m in recent}
+    unique_hits = [
+        h for h in hits
+        if h.session_id == req.session_id
+        and h.content not in recent_contents
+        and not (h.role == "assistant" and _looks_like_refusal(h.content))
+    ]
+
+    # Apply the same refusal-filter to the recent SQLite history before
+    # appending it to the prompt — this is the stronger contamination path.
+    sanitized_recent = [
+        m for m in recent
+        if not (m["role"] == "assistant" and _looks_like_refusal(m["content"]))
+    ]
+
+    messages: list[dict] = []
+
+    # Inject relevant document chunks first (highest priority context).
+    # Deduplicate by text content — the same chunk may appear multiple times
+    # if the same document was ingested more than once.
+    seen_texts: set[str] = set()
+    relevant_chunks = []
+    for c in doc_chunks:
+        if c.text not in seen_texts:
+            seen_texts.add(c.text)
+            relevant_chunks.append(c)
+    if relevant_chunks:
+        doc_lines = "\n".join(
+            f"[{c.source}]\n{c.text}" for c in relevant_chunks
+        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "You are the project brain for a local-first personal assistant. "
+                "The excerpts below were retrieved from THIS user's own knowledge "
+                "base — ingested documents and PM tickets (Jira / GitHub) synced "
+                "into this project by the user themselves. They are the "
+                "authoritative source of truth for this project.\n\n"
+                "Rules:\n"
+                "1. When the user asks about tickets, issues, tasks, status, or "
+                "   assignees, answer FROM these excerpts.\n"
+                "2. Cite the source label in square brackets, e.g. [jira:KAN-1].\n"
+                "3. Never claim you lack access to the user's PM system — the "
+                "   relevant data is provided to you directly below.\n"
+                "4. If the excerpts do not contain the answer, say so plainly "
+                "   and suggest the user run Sync.\n\n"
+                "--- PROJECT KNOWLEDGE ---\n"
+                f"{doc_lines}\n"
+                "--- END PROJECT KNOWLEDGE ---"
+            ),
+        })
+
+    # Then inject relevant past conversation messages.
+    if unique_hits:
+        context_lines = "\n".join(
+            f"- [{h.role}]: {h.content}" for h in unique_hits
+        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "The following messages from earlier in this conversation may be "
+                "relevant to the user's current question:\n" + context_lines
+            ),
+        })
+
+    # Inject the TOOLS block when PM integrations are live for this project.
+    # Only shown when the project has at least one ref matching a configured
+    # integration — avoids cluttering prompts for projects with no PM links.
+    project_for_tools = await project_store.get(req.project_id)
+    live_refs = {
+        k for k in (project_for_tools.external_refs if project_for_tools else {})
+        if k in _integrations
+    }
+    if live_refs:
+        # Build concrete examples using the actual ref_key names so the LLM
+        # cannot confuse the key name (e.g. "jira_project_key") with the value
+        # (e.g. "KAN").
+        example_ref_key = next(iter(live_refs))
+        example_action = (
+            "jira:add_comment" if "jira" in example_ref_key else "github:add_comment"
+        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "TOOLS YOU CAN PROPOSE\n"
+                "You may propose at most one write action per reply by emitting "
+                "this exact JSON block on its own line — copy the format exactly:\n"
+                f'<<DRAFT_ACTION>>{{"action_type":"{example_action}",'
+                f'"payload":{{"item_id":"TICKET-123","body":"your comment here",'
+                f'"ref_key":"{example_ref_key}"}}}}'
+                "<<END>>\n"
+                f'IMPORTANT: ref_key must be exactly "{example_ref_key}" '
+                f"(not the ticket ID, not the project name — the literal string "
+                f'"{example_ref_key}").\n'
+                "Only propose when the user explicitly asks you to comment on a ticket. "
+                "The user will approve or reject in the Pending Actions panel before "
+                "any write reaches the external system."
+            ),
+        })
+
+    # Append sanitized recent history and the new user message.
+    messages += sanitized_recent + [{"role": "user", "content": req.message}]
+
+    logger.info(
+        "LLM prompt for project=%s session=%s: %d messages, roles=%s, "
+        "doc_chunks=%d, memory_hits=%d, recent=%d",
+        req.project_id, req.session_id, len(messages),
+        [m["role"] for m in messages],
+        len(relevant_chunks), len(unique_hits), len(sanitized_recent),
+    )
+    logger.debug("LLM full messages: %s", messages)
+
+    # 6. Call DeepSeek.
+    reply = await chat(messages)
+
+    # Post-process the reply: extract <<DRAFT_ACTION>>{...}<<END>> if present.
+    # On success, create a pending action and replace the tag with a human-
+    # readable marker.  On any parse/validation error, strip the tag silently
+    # so the raw JSON never reaches the user's transcript.
+    draft_pattern = re.compile(r"<<DRAFT_ACTION>>(.*?)<<END>>", re.DOTALL)
+    match = draft_pattern.search(reply)
+    if match:
+        raw_json = match.group(1).strip()
+        try:
+            draft = json.loads(raw_json)
+            action_type = draft.get("action_type", "")
+            payload = draft.get("payload", {})
+            if (
+                action_type in VALID_ACTION_TYPES
+                and payload.get("item_id")
+                and payload.get("body")
+                and payload.get("ref_key")
+            ):
+                action_id = await action_store.create_pending(
+                    req.project_id, action_type, payload
+                )
+                replacement = (
+                    f"\n[Drafted action #{action_id[:8]}… — "
+                    "approve in the Pending Actions panel]\n"
+                )
+                logger.info(
+                    "Drafted action %s (type=%s item=%s) for project %s",
+                    action_id, action_type, payload.get("item_id"), req.project_id,
+                )
+            else:
+                replacement = ""
+                logger.warning(
+                    "DRAFT_ACTION block had missing or invalid fields — stripped. "
+                    "action_type=%r payload keys=%s",
+                    action_type, list(payload.keys()),
+                )
+        except (json.JSONDecodeError, TypeError) as exc:
+            replacement = ""
+            logger.warning("Could not parse DRAFT_ACTION block: %s", exc)
+        reply = draft_pattern.sub(replacement, reply).strip()
+
+    # 7. Persist the assistant reply to SQLite (cleaned of any DRAFT_ACTION tags).
+    await store.append(req.project_id, req.session_id, "assistant", reply)
+
+    # 8. Store the assistant reply vector in Qdrant conversations.
+    reply_vec = await embed(reply)
+    await vstore.upsert(
+        settings.qdrant_collection,
+        project_id=req.project_id,
+        vector=reply_vec,
+        payload={"session_id": req.session_id, "role": "assistant", "content": reply},
+    )
+
+    # 9. Return.
+    return ChatResponse(reply=reply)
+
+
+@app.get("/memory/search", response_model=list[MemoryHit])
+async def memory_search(
+    project_id: str = Query(..., description="Restrict search to this project."),
+    q: str = Query(..., description="The text to search for in vector memory."),
+    k: int = Query(5, ge=1, le=20, description="Number of results to return."),
+) -> list[MemoryHit]:
+    """Search conversation vector memory (within one project) for messages
+    semantically similar to q.
+
+    This is a debug / inspection endpoint — it lets you see what the agent
+    would retrieve as context for a given query without making a full chat call.
+
+    Example:
+        GET /memory/search?project_id=<uuid>&q=what+is+my+name&k=3
+    """
+    await _require_project(project_id)
+
+    vec = await embed(q)
+    hits = await vstore.search(
+        settings.qdrant_collection,
+        project_id=project_id,
+        vector=vec,
+        k=k,
+    )
+    return [
+        MemoryHit(
+            score=h.score,
+            role=h.role,
+            content=h.content,
+            session_id=h.session_id,
+        )
+        for h in hits
+    ]

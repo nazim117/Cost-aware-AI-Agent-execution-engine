@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   policy-engine:
     build:
@@ -72,8 +70,50 @@ services:
     depends_on:
       - agent-executor
 
+  # chat-agent — personal AI agent service (Steps 1–4 of the build plan).
+  # Runs on port 8084; persists conversation history in a named Docker volume.
+  chat-agent:
+    build: ./services/chat-agent
+    ports:
+      - "8084:8084"
+    env_file:
+      - .env
+    environment:
+      - PORT=8084
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      # Store the SQLite file in the mounted volume so it survives restarts.
+      - SQLITE_PATH=/data/chat.db
+      # Inside Docker Compose, services find each other by service name.
+      # "qdrant" resolves to the qdrant container on the shared network.
+      - QDRANT_URL=http://qdrant:6333
+      # Ollama runs on the host machine, not in Docker.
+      # host.docker.internal is a special DNS name that Docker resolves to the
+      # host machine's IP address from inside a container.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - chat-db:/data
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  # qdrant — vector database for semantic memory (Step 2+).
+  # Stores message embeddings and supports similarity search.
+  qdrant:
+    image: qdrant/qdrant:v1.13.1
+    ports:
+      - "6333:6333"   # HTTP API
+      - "6334:6334"   # gRPC API (not used yet, but exposed for tooling)
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
 volumes:
   gateway-audit:
+  # Persists the SQLite database across container restarts.
+  chat-db:
+  # Persists Qdrant vector index across container restarts.
+  qdrant-data:
 
 networks:
   default:

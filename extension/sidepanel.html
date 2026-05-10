@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Project Brain</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      background: #f9f9f9;
+      color: #222;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      padding: 12px 16px;
+      background: #1a1a2e;
+      color: #fff;
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: 0.3px;
+      flex-shrink: 0;
+    }
+
+    /* ── Project bar ── */
+    #project-bar {
+      display: flex;
+      gap: 6px;
+      padding: 8px 16px;
+      background: #ececf3;
+      border-bottom: 1px solid #d9d9e0;
+      flex-shrink: 0;
+      align-items: center;
+    }
+
+    #project-bar label {
+      font-size: 12px;
+      color: #555;
+      font-weight: 500;
+    }
+
+    #project-select {
+      flex: 1;
+      padding: 5px 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      background: #fff;
+    }
+
+    .icon-btn {
+      padding: 5px 8px;
+      background: #fff;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .icon-btn:hover {
+      background: #f0f0f0;
+    }
+
+    .icon-btn.danger:hover {
+      background: #fee;
+      border-color: #e88;
+    }
+
+    /* ── Transcript ── */
+    #transcript {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .bubble {
+      max-width: 90%;
+      padding: 8px 12px;
+      border-radius: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .bubble.user {
+      align-self: flex-end;
+      background: #1a1a2e;
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+
+    .bubble.assistant {
+      align-self: flex-start;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-bottom-left-radius: 3px;
+    }
+
+    /* ── Status bar ── */
+    #status {
+      padding: 4px 16px;
+      font-size: 12px;
+      color: #666;
+      min-height: 22px;
+      flex-shrink: 0;
+    }
+
+    /* ── Use page button ── */
+    #use-page-btn {
+      margin: 0 16px 8px;
+      padding: 8px 12px;
+      background: #f0f0f0;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      text-align: left;
+      flex-shrink: 0;
+      transition: background 0.15s;
+    }
+
+    #use-page-btn:hover {
+      background: #e4e4e4;
+    }
+
+    #use-page-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* ── Input row ── */
+    #input-row {
+      display: flex;
+      gap: 8px;
+      padding: 8px 16px 12px;
+      border-top: 1px solid #e0e0e0;
+      background: #fff;
+      flex-shrink: 0;
+    }
+
+    #input {
+      flex: 1;
+      padding: 8px 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+      resize: none;
+    }
+
+    #input:focus {
+      border-color: #1a1a2e;
+    }
+
+    #send-btn {
+      padding: 8px 16px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      transition: opacity 0.15s;
+    }
+
+    #send-btn:hover {
+      opacity: 0.85;
+    }
+
+    #send-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* ── Project settings panel ── */
+    #settings-panel {
+      padding: 10px 16px;
+      background: #f4f4fb;
+      border-bottom: 1px solid #d9d9e0;
+      flex-shrink: 0;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    #settings-panel.visible {
+      display: flex;
+    }
+
+    #settings-panel label {
+      font-size: 12px;
+      color: #555;
+      font-weight: 500;
+    }
+
+    #settings-panel input {
+      width: 100%;
+      padding: 5px 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-top: 2px;
+    }
+
+    #settings-save-btn {
+      align-self: flex-end;
+      padding: 5px 14px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    #settings-save-btn:hover {
+      opacity: 0.85;
+    }
+
+    /* ── Pending-actions panel ── */
+    #actions-panel {
+      padding: 10px 16px;
+      background: #fffbf0;
+      border-bottom: 1px solid #ead9a0;
+      flex-shrink: 0;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 260px;
+      overflow-y: auto;
+    }
+
+    #actions-panel.visible {
+      display: flex;
+    }
+
+    #actions-panel .panel-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #555;
+    }
+
+    .action-row {
+      background: #fff;
+      border: 1px solid #e0d080;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .action-row .action-meta {
+      color: #888;
+      font-size: 11px;
+    }
+
+    .action-row .action-body {
+      color: #333;
+    }
+
+    .action-row .action-btns {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .action-row .approve-btn {
+      padding: 3px 10px;
+      background: #2d7a2d;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .action-row .approve-btn:hover { opacity: 0.85; }
+
+    .action-row .reject-btn {
+      padding: 3px 10px;
+      background: #fff;
+      color: #c0392b;
+      border: 1px solid #c0392b;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .action-row .reject-btn:hover { background: #fee; }
+
+    /* Badge on the actions button */
+    #actions-badge {
+      display: inline-block;
+      background: #e8a020;
+      color: #fff;
+      border-radius: 10px;
+      padding: 0 5px;
+      font-size: 11px;
+      margin-left: 2px;
+      min-width: 16px;
+      text-align: center;
+    }
+
+    #actions-badge.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header>🧠 Project Brain</header>
+
+  <!-- Project selector — every chat/ingest call is scoped to the chosen project. -->
+  <div id="project-bar">
+    <label for="project-select">Project:</label>
+    <select id="project-select"></select>
+    <button id="new-project-btn" class="icon-btn" title="New project">＋</button>
+    <button id="delete-project-btn" class="icon-btn danger" title="Delete current project">🗑</button>
+    <button id="settings-btn" class="icon-btn" title="Project settings (integrations)">⚙</button>
+    <button id="sync-btn" class="icon-btn" title="Sync PM integrations (Jira / GitHub)">⟳</button>
+    <button id="actions-btn" class="icon-btn" title="Pending actions (approve / reject writes)">📋 <span id="actions-badge" class="hidden">0</span></button>
+  </div>
+
+  <!-- Collapsible settings panel — attach Jira / GitHub refs to the current project. -->
+  <div id="settings-panel">
+    <div>
+      <label for="jira-key-input">Jira project key</label>
+      <input id="jira-key-input" type="text" placeholder="e.g. KAN" autocomplete="off" />
+    </div>
+    <div>
+      <label for="github-repo-input">GitHub repo</label>
+      <input id="github-repo-input" type="text" placeholder="e.g. org/repo" autocomplete="off" />
+    </div>
+    <button id="settings-save-btn">Save</button>
+  </div>
+
+  <!-- Collapsible pending-actions panel — approve or reject agent-drafted PM writes. -->
+  <div id="actions-panel">
+    <div class="panel-title">Pending actions — approve before writing to Jira / GitHub</div>
+    <div id="actions-list"></div>
+  </div>
+
+  <div id="transcript"></div>
+
+  <div id="status"></div>
+
+  <button id="use-page-btn">📄 Use current page as context</button>
+
+  <div id="input-row">
+    <input id="input" type="text" placeholder="Ask anything…" autocomplete="off" />
+    <button id="send-btn">Send</button>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
