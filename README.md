@@ -1,648 +1,397 @@
-# Cost-aware AI Agent Execution Engine
+# Project Brain - Local-first AI Project Memory Assistant
 
-A lightweight control plane for AI agents that enforces **cost**, **latency**, **execution policies**, and **PII safety** before agent steps run.
+Project Brain is a local-first AI assistant for project managers and knowledge
+workers. It keeps project-scoped memory, ingests documents and meeting
+transcripts, retrieves relevant context with RAG, and can sync Jira/GitHub work
+items into a private project knowledge base.
 
-## What problem does this solve?
+The current active architecture is centered on the FastAPI `chat-agent` service.
+The older Go services in `services/agent-executor`, `services/policy-engine`,
+`services/gateway`, and `services/mcp-server` are legacy code and are not part
+of the active Project Brain runtime.
 
-**AI agents tend to:**
-- overspend on expensive models
-- ignore latency constraints
-- behave unpredictably under load or tight budgets
-- leak personally identifiable information (PII) into LLM calls — especially critical for research and data agents whose goals naturally contain emails, phone numbers, and other sensitive identifiers
+## What It Does
 
-**This system introduces deterministic, explainable control:**
-- budgets are enforced at runtime
-- latency SLAs influence model choice
-- execution degrades gracefully instead of failing
-- PII is scanned, redacted, or blocked before any text reaches the model
-- every LLM call is audit-logged with PII detection results
+- Creates isolated project workspaces with their own memory and sources
+- Stores conversation history in SQLite
+- Stores semantic memory and document chunks in Qdrant
+- Uses Ollama for local embeddings
+- Supports Ollama chat or an OpenAI-compatible chat backend
+- Ingests pasted text, files, URLs, webpages, and transcripts
+- Extracts decisions, action items, and risks from meeting transcripts
+- Syncs Jira issues and GitHub issues/PRs into project RAG memory
+- Lets the assistant draft Jira/GitHub comments for human approval
+- Provides a React dashboard and a Chrome side-panel extension
 
-## Architecture
+## Active Architecture
 
-The system consists of **five services:**
+```mermaid
+flowchart LR
+  User["Project manager"] --> Dashboard["React dashboard"]
+  User --> Extension["Chrome extension"]
 
-```
-┌─────────────┐     POST /agent/run      ┌───────────────────┐
-│  dashboard  │ ───────────────────────► │  agent-executor   │
-│   :3000     │                          │     :8081         │
-└─────────────┘                          └────────┬──────────┘
-                                                  │
-                     ┌────────────────────────────┼──────────────────────┐
-                     │                            │                      │
-                     ▼                            ▼                      │
-         ┌───────────────────┐       ┌───────────────────┐              │
-         │  policy-engine    │       │     gateway        │              │
-         │     :8080         │       │     :8082          │              │
-         │                   │       │                    │              │
-         │  Evaluates step   │       │  Scans PII         │              │
-         │  against budget   │       │  Redacts/blocks    │◄─────────────┘
-         │  and latency SLA  │       │  Forwards to LLM   │
-         │  Returns model    │       │  Audit logs every  │
-         │  tier decision    │       │  request           │
-         └───────────────────┘       └────────┬───────────┘
-                                              │
-                     ┌────────────────────────┤
-                     │                        │
-                     ▼                        ▼
-         ┌───────────────────┐   ┌───────────────────┐
-         │   mcp-server      │   │   DeepSeek API    │
-         │     :8083         │   │  (or any OpenAI-  │
-         │                   │   │  compatible LLM)  │
-         │  Web search via   │   └───────────────────┘
-         │  Brave Search API │
-         └───────────────────┘
+  Dashboard -->|/api in dev| ChatAgent["FastAPI chat-agent :8084"]
+  Extension -->|localhost:8084| ChatAgent
+
+  ChatAgent --> SQLite[("SQLite chat.db")]
+  ChatAgent --> Qdrant[("Qdrant")]
+  ChatAgent --> Ollama["Ollama embeddings/chat"]
+  ChatAgent --> LLM["OpenAI-compatible chat backend"]
+  ChatAgent --> Jira["Jira Cloud"]
+  ChatAgent --> GitHub["GitHub REST API"]
+  ChatAgent --> Web["YouTube/Wikipedia/URLs"]
 ```
 
-### agent-executor `:8081`
-- Orchestrates agent steps by bridging a configurable step graph
-- Asks the policy engine which model tier to use for each step
-- Routes every LLM call through the gateway (PII enforcement is mandatory, not optional)
-- Exposes runtime metrics
+### Main Containers
 
-### policy-engine `:8080`
-- Evaluates each step against the remaining budget, step type, and latency SLA
-- Returns an explicit decision: allowed tier, hard stop flag, and a reason string
-- Enables graceful degradation (e.g. downgrade to `cheap`, route to summarize on hard stop)
+| Container | Path | Responsibility |
+|---|---|---|
+| chat-agent | `services/chat-agent/` | FastAPI backend for projects, chat, RAG, memory, sync, transcript processing, and action approval |
+| qdrant | Docker image `qdrant/qdrant` | Vector database for conversation and document embeddings |
+| dashboard | `dashboard/` | React UI for projects, chat, sources, sync, pending actions, transcript outputs, and briefings |
+| extension | `extension/` | Chrome side panel for chatting, ingesting current pages, syncing, and approving actions |
+| ollama | host service | Local embedding model and optional local chat model |
 
-### gateway `:8082`
-- Scans every message for PII (SSN, email, credit card, phone) before forwarding
-- Two modes, controlled by `BLOCK_ON_PII`:
-  - **Redact** (default): replaces PII with `[REDACTED]` and continues
-  - **Block**: rejects the request with HTTP 403
-- Forwards cleaned requests to the upstream LLM (DeepSeek by default)
-- Appends a structured JSON audit log entry for every request (blocked or forwarded)
-- Also usable as a standalone OpenAI-compatible proxy
+## Repository Layout
 
-### mcp-server `:8083`
-- Provides web search capability to agents via the Brave Search API
-- Optional — agents degrade gracefully if no `BRAVE_SEARCH_API_KEY` is set
+```text
+services/
+  chat-agent/
+    main.py                 FastAPI app and route orchestration
+    config.py               Runtime settings from environment variables
+    projects.py             SQLite project store and schema version
+    memory.py               SQLite conversation history
+    vectors.py              Qdrant client wrapper and project filters
+    embeddings.py           Ollama embedding client
+    rag.py                  Chunking, document ingest, retrieval, source listing
+    llm.py                  Ollama/OpenAI-compatible chat client
+    transcript.py           Transcript extraction and structured SQLite storage
+    briefing.py             Project briefing assembler
+    sync.py                 Jira/GitHub sync orchestration
+    actions.py              Human approval action lifecycle
+    extractors.py           File, audio, YouTube, Wikipedia, and generic URL extraction
+    integrations/
+      base.py               Shared integration contract
+      jira.py               Jira Cloud adapter
+      github.py             GitHub issues adapter
+    tests/                  pytest coverage for core backend behaviour
 
-### dashboard `:3000`
-- Web UI for submitting agent runs and viewing results and metrics
+dashboard/
+  src/App.jsx               Project Brain dashboard UI
+  src/api.js                API wrapper for chat-agent routes
+  vite.config.js            Dev proxy from /api to localhost:8084
 
-## Features
+extension/
+  sidepanel.js              Chrome side panel UI logic
+  background.js             Active-tab text extraction broker
+  content.js                Page text extraction content script
+  sidepanel.html            Extension UI shell
+```
 
-- Cost-aware execution (cheap / standard / premium model tiers)
-- Latency-aware policy decisions
-- Hard stops when constraints are violated
-- Explainable decisions (reason field on every step)
-- Runtime metrics (`/metrics`)
-- PII scanning on every LLM call — SSN, email, credit card, phone
-- Configurable redact-or-block PII enforcement
-- Structured audit log (JSONL) with PII detection results per request
-- Configurable step graph — define arbitrary agent workflows per request
+## Data and Storage Model
 
----
+Project Brain uses a single SQLite database plus two Qdrant collections.
+
+SQLite tables:
+
+| Table | Purpose |
+|---|---|
+| `projects` | Project records and external references such as Jira project key or GitHub repo |
+| `schema_version` | Startup schema compatibility marker |
+| `messages` | Conversation history scoped by `project_id` and `session_id` |
+| `sync_state` | Last sync timestamp per project external reference |
+| `actions` | Sync audit rows and pending/approved/rejected/executed/failed write actions |
+| `decisions` | Decisions extracted from transcripts |
+| `action_items` | Action items extracted from transcripts |
+| `risks` | Risks extracted from transcripts |
+
+Qdrant collections:
+
+| Collection | Payload | Purpose |
+|---|---|---|
+| `conversations` | `project_id`, `session_id`, `role`, `content` | Semantic conversation memory |
+| `documents` | `project_id`, `source`, `chunk_index`, `text` | RAG chunks from documents, pages, tickets, and transcripts |
+
+Project isolation is enforced by storing `project_id` on every SQLite row and
+every Qdrant payload, then filtering all reads by that project id.
+
+## Runtime Flows
+
+### Chat
+
+```mermaid
+sequenceDiagram
+  participant UI as Dashboard/Extension
+  participant API as chat-agent /chat
+  participant SQL as SQLite
+  participant O as Ollama embeddings
+  participant Q as Qdrant
+  participant L as Chat LLM
+
+  UI->>API: POST /chat
+  API->>SQL: Load recent project/session history
+  API->>SQL: Append user message
+  API->>O: Embed user message
+  API->>Q: Search conversation memory by project_id
+  API->>Q: Search document chunks by project_id
+  API->>Q: Store user vector
+  API->>L: Send prompt with RAG, memory, and history
+  L-->>API: Reply, optionally with DRAFT_ACTION
+  API->>SQL: Store assistant reply and optional pending action
+  API->>O: Embed assistant reply
+  API->>Q: Store assistant vector
+  API-->>UI: Reply and citations
+```
+
+### Document Ingestion
+
+```mermaid
+sequenceDiagram
+  participant UI as Dashboard/Extension
+  participant API as chat-agent
+  participant R as rag.py
+  participant O as Ollama embeddings
+  participant Q as Qdrant documents
+
+  UI->>API: POST /ingest, /ingest/file, or /ingest/url
+  API->>API: Validate project and extract text
+  API->>R: Chunk text
+  loop each chunk
+    R->>O: Embed chunk
+    R->>Q: Upsert project-scoped chunk payload
+  end
+  API-->>UI: Stored chunk count
+```
+
+### Transcript Ingestion
+
+```mermaid
+sequenceDiagram
+  participant UI
+  participant API as /ingest/transcript
+  participant Q as Qdrant documents
+  participant L as Chat LLM
+  participant SQL as SQLite
+
+  UI->>API: Transcript source and text
+  API->>Q: Replace existing chunks for source
+  API->>Q: Store transcript chunks for RAG
+  API->>L: Extract decisions/action_items/risks as JSON
+  API->>SQL: Replace structured rows for source
+  API-->>UI: Chunk and extraction counts
+```
+
+### Human Approval for External Writes
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant UI as Dashboard/Extension
+  participant API as chat-agent
+  participant SQL as SQLite actions
+  participant PM as Jira/GitHub
+
+  User->>UI: Ask assistant to comment on an issue
+  UI->>API: POST /chat
+  API->>SQL: Create pending action from DRAFT_ACTION
+  UI->>API: GET /projects/{project_id}/actions?status=pending
+  User->>UI: Approve
+  UI->>API: POST /actions/{action_id}/approve
+  API->>PM: Add comment
+  PM-->>API: Comment id/url
+  API->>SQL: Mark action executed
+  API-->>UI: Result URL
+```
+
+## API Overview
+
+The active API is served by `services/chat-agent/main.py`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness check |
+| POST | `/projects` | Create a project |
+| GET | `/projects` | List projects |
+| PATCH | `/projects/{project_id}` | Update project name or external refs |
+| DELETE | `/projects/{project_id}` | Delete project and cascade memory/sources/actions |
+| POST | `/projects/{project_id}/sync` | Sync configured Jira/GitHub refs |
+| GET | `/projects/{project_id}/sync` | Show sync state |
+| POST | `/projects/{project_id}/actions` | Create a pending action |
+| GET | `/projects/{project_id}/actions` | List actions, optionally by status |
+| POST | `/actions/{action_id}/approve` | Execute an approved Jira/GitHub comment action |
+| POST | `/actions/{action_id}/reject` | Reject a pending action |
+| POST | `/ingest` | Ingest plain text into RAG |
+| POST | `/ingest/transcript` | Ingest transcript and extract structured rows |
+| POST | `/ingest/file` | Upload `.txt`, `.md`, `.pdf`, `.docx`, `.mp3`, `.wav`, or `.m4a` |
+| POST | `/ingest/url` | Ingest YouTube, Wikipedia, or generic web content |
+| GET | `/projects/{project_id}/decisions` | List transcript decisions |
+| GET | `/projects/{project_id}/action-items` | List transcript action items |
+| GET | `/projects/{project_id}/risks` | List transcript risks |
+| GET | `/projects/{project_id}/briefing` | Generate a project briefing |
+| GET | `/projects/{project_id}/sources` | List ingested sources |
+| POST | `/chat` | Chat with project memory and RAG |
+| GET | `/memory/search` | Debug semantic conversation memory search |
+
+## Configuration
+
+`chat-agent` reads environment variables through `services/chat-agent/config.py`.
+Values can come from the repo-root `.env`, a service-local `.env`, Docker
+Compose, or the shell.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_PROVIDER` | `ollama` | `ollama` or `openai_compatible` |
+| `OLLAMA_CHAT_MODEL` | `llama3` | Ollama chat model |
+| `OPENAI_BASE_URL` | empty | Base URL for OpenAI-compatible chat |
+| `OPENAI_API_KEY` | empty | API key for OpenAI-compatible chat |
+| `OPENAI_MODEL` | empty | Model name for OpenAI-compatible chat |
+| `OPENAI_PROVIDER_LABEL` | `openai-compatible` | Name used in error messages |
+| `SQLITE_PATH` | `chat.db` | SQLite database path |
+| `PORT` | `8084` | FastAPI port |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant URL |
+| `QDRANT_COLLECTION` | `conversations` | Conversation vector collection |
+| `QDRANT_DOCS_COLLECTION` | `documents` | Document vector collection |
+| `MEMORY_SEARCH_K` | `5` | Number of conversation memory hits |
+| `JIRA_BASE_URL` | empty | Jira Cloud base URL |
+| `JIRA_EMAIL` | empty | Jira Cloud account email |
+| `JIRA_API_TOKEN` | empty | Jira Cloud API token |
+| `GITHUB_TOKEN` | empty | GitHub Personal Access Token |
+
+Minimal local `.env` for Ollama chat:
+
+```bash
+LLM_PROVIDER=ollama
+OLLAMA_CHAT_MODEL=llama3
+OLLAMA_EMBED_MODEL=nomic-embed-text
+QDRANT_URL=http://localhost:6333
+```
+
+For DeepSeek or another OpenAI-compatible backend:
+
+```bash
+LLM_PROVIDER=openai_compatible
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=deepseek-chat
+OPENAI_PROVIDER_LABEL=DeepSeek
+```
 
 ## Quick Start
 
 ### Prerequisites
 
-- Docker and Docker Compose
-- A DeepSeek API key (or any OpenAI-compatible API key)
-- _(local dev only)_ Go 1.21+
-
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/nazim117/Cost-aware-AI-Agent-execution-engine.git
-cd Cost-aware-AI-Agent-execution-engine
-```
-
-### 2. Set up your environment file
-
-Create a `.env` file at the repo root. Docker Compose reads it automatically — no export needed.
+- Python 3.12+
+- Docker and Docker Compose for Qdrant
+- Ollama running locally
+- Ollama embedding model:
 
 ```bash
-cp .env.example .env
+ollama pull nomic-embed-text
 ```
 
-Then open `.env` and fill in your keys. At minimum:
+If using local Ollama chat:
 
 ```bash
-# Required — the LLM the gateway forwards requests to
-DEEPSEEK_API_KEY=your_deepseek_key_here
-
-# Optional — enables web search in agent steps
-# Leave blank to run without search capability
-BRAVE_SEARCH_API_KEY=
+ollama pull llama3
 ```
 
-All other values have working defaults. See [Environment Variables](#environment-variables) for the full list.
-
-### 3. Start with Docker Compose
+### 1. Start Qdrant
 
 ```bash
-docker compose up --build
+docker compose up qdrant -d
 ```
 
-This builds and starts all five services. The first build takes a minute or two — subsequent starts are much faster.
-
-To run in the background:
+### 2. Start chat-agent
 
 ```bash
-docker compose up --build -d
+cd services/chat-agent
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8084
 ```
 
-### 4. Verify the services are up
+On macOS/Linux, activate the environment with:
 
 ```bash
-curl http://localhost:8081/health   # agent-executor
-curl http://localhost:8080/health   # policy-engine
-curl http://localhost:8082/health   # gateway
+source venv/bin/activate
 ```
 
-Each should return:
-
-```json
-{"status": "healthy"}
-```
-
-The dashboard is available at **http://localhost:3000**.
-
-### 5. Run your first agent job
+### 3. Start the dashboard
 
 ```bash
-curl -X POST http://localhost:8081/agent/run \
-  -H "Content-Type: application/json" \
-  -d '{
-    "goal": "Analyze customer churn for the EMEA region",
-    "budget": 0.10,
-    "priority": "normal",
-    "latency_sla_ms": 300
-  }'
+cd dashboard
+npm install
+npm run dev
 ```
 
-### 6. Check metrics
+Open `http://localhost:5173`.
+
+### 4. Use the extension
+
+See [extension/README.md](extension/README.md). The extension talks directly to
+`http://localhost:8084`.
+
+## Running Tests
+
+Chat-agent tests:
 
 ```bash
-curl http://localhost:8081/metrics
+cd services/chat-agent
+pytest
 ```
 
-### 7. Stop the services
+Dashboard lint:
 
 ```bash
-docker compose down
+cd dashboard
+npm run lint
 ```
 
----
-
-## Environment Variables
-
-Place these in a `.env` file at the repo root. Docker Compose picks it up automatically.
-
-| Service | Variable | Default | Description |
-|---|---|---|---|
-| gateway | `DEEPSEEK_API_KEY` | — | **Required.** API key for the upstream LLM |
-| gateway | `BLOCK_ON_PII` | `false` | `true` to reject requests containing PII; `false` to redact and continue |
-| gateway | `AUDIT_LOG_PATH` | `audit.jsonl` | Path to the JSONL audit log file |
-| gateway | `PORT` | `8082` | Listening port |
-| agent-executor | `DEEPSEEK_API_KEY` | — | Used by the local PII scanner fallback when no gateway is reachable |
-| agent-executor | `GATEWAY_URL` | `http://gateway:8082` | Gateway base URL (set automatically in Docker Compose) |
-| agent-executor | `POLICY_ENGINE_URL` | `http://policy-engine:8080` | Policy engine base URL (set automatically in Docker Compose) |
-| agent-executor | `MCP_SERVER_URL` | `http://mcp-server:8083` | MCP server base URL (set automatically in Docker Compose) |
-| agent-executor | `PORT` | `8081` | Listening port |
-| mcp-server | `BRAVE_SEARCH_API_KEY` | — | Optional. Enables web search. Leave blank to disable. |
-| mcp-server | `PORT` | `8083` | Listening port |
-| policy-engine | `PORT` | `8080` | Listening port |
-
-**Minimal `.env` to get started (no web search):**
-
-```bash
-DEEPSEEK_API_KEY=your_deepseek_key_here
-```
-
-**With web search enabled:**
-
-```bash
-DEEPSEEK_API_KEY=your_deepseek_key_here
-BRAVE_SEARCH_API_KEY=your_brave_key_here
-```
-
-**With PII blocking enabled (reject instead of redact):**
-
-```bash
-DEEPSEEK_API_KEY=your_deepseek_key_here
-BLOCK_ON_PII=true
-```
-
----
-
-## Local Development (without Docker)
-
-Start each service in a separate terminal. Start them in this order — `agent-executor` depends on the others being ready.
-
-```bash
-# Terminal 1 — policy engine
-cd services/policy-engine
-go run ./cmd/server
-```
-
-```bash
-# Terminal 2 — gateway
-cd services/gateway
-DEEPSEEK_API_KEY=your_key go run ./cmd/server
-```
-
-```bash
-# Terminal 3 — mcp-server
-cd services/mcp-server
-BRAVE_SEARCH_API_KEY=your_key go run ./cmd/server   # key optional
-```
-
-```bash
-# Terminal 4 — agent-executor
-cd services/agent-executor
-DEEPSEEK_API_KEY=your_key \
-  POLICY_ENGINE_URL=http://localhost:8080 \
-  GATEWAY_URL=http://localhost:8082 \
-  MCP_SERVER_URL=http://localhost:8083 \
-  go run ./cmd/server
-```
-
-> When running locally, service URLs use `localhost`. Docker Compose sets these automatically using container hostnames — you don't need to set them manually there.
-
-### Running Tests
-
-```bash
-# Policy engine
-cd services/policy-engine
-go test ./...
-
-# Agent executor
-cd services/agent-executor
-go test ./...
-```
-
----
-
-## API Reference
-
-### POST /agent/run
-
-Run an agent against a step graph. The engine evaluates each step, enforces budget and latency constraints, scans for PII, and calls the LLM.
-
-**Request:**
-
-```json
-{
-  "goal": "Analyze customer churn for the EMEA region",
-  "budget": 0.10,
-  "priority": "normal",
-  "latency_sla_ms": 300,
-  "step_graph": {
-    "entry": "plan",
-    "nodes": {
-      "plan": {
-        "name": "plan",
-        "edges": [
-          { "to": "execute", "condition": { "always": true } }
-        ]
-      },
-      "execute": {
-        "name": "execute",
-        "step_type": "execute",
-        "edges": [
-          { "to": "summarize", "condition": { "budget_ratio_below": 0.3 } },
-          { "to": "execute",   "condition": { "always": true } }
-        ]
-      },
-      "summarize": {
-        "name": "summarize",
-        "edges": []
-      }
-    }
-  }
-}
-```
-
-**Fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `goal` | string | yes | Free-form task description. Scanned for PII before reaching the LLM. |
-| `budget` | float | yes | Total budget for the entire run in USD |
-| `latency_sla_ms` | int | yes | Maximum acceptable per-step latency in milliseconds |
-| `priority` | string | no | Reserved for future policy extensions |
-| `step_graph` | object | no | Custom step graph. Omit to use the built-in default (plan → execute → summarize) |
-
-**Step graph fields:**
-
-| Field | Description |
-|---|---|
-| `entry` | Name of the first node to execute |
-| `nodes` | Map of node name → node definition |
-| `step_type` | `plan`, `execute`, or `summarize`. Determines baseline model tier and system prompt. Defaults to node name if omitted. |
-| `edges[].to` | Name of the next node |
-| `edges[].condition.always` | Unconditional transition |
-| `edges[].condition.budget_ratio_below` | Transition when `remaining/total` drops below this value |
-| `edges[].condition.on_hard_stop` | Transition when policy engine issues a hard stop |
-
-**Successful response:**
-
-```json
-{
-  "result": "simulated agent result",
-  "total_cost": 0.05,
-  "total_latency_ms": 1340,
-  "steps": [
-    {
-      "step": "plan",
-      "model_tier": "premium",
-      "cost": 0.030,
-      "latency_ms": 450,
-      "decision": "planning_premium_allowed"
-    },
-    {
-      "step": "execute",
-      "model_tier": "standard",
-      "cost": 0.015,
-      "latency_ms": 200,
-      "decision": "execution_standard_allowed"
-    },
-    {
-      "step": "summarize",
-      "model_tier": "cheap",
-      "cost": 0.005,
-      "latency_ms": 80,
-      "decision": "summarize_forced_cheap"
-    }
-  ]
-}
-```
-
-**PII blocked response** (when `BLOCK_ON_PII=true` and goal contains PII):
-
-```
-HTTP 422 Unprocessable Entity
-```
-
-```json
-{
-  "error": {
-    "type": "pii_violation",
-    "message": "Request blocked: PII detected in goal",
-    "pii_types": ["email", "phone"]
-  }
-}
-```
-
----
-
-### GET /metrics
-
-Returns runtime counters for the agent-executor.
-
-```json
-{
-  "AgentRunsTotal": 5,
-  "AgentStepsTotal": {
-    "plan":      { "premium": 4, "standard": 1 },
-    "execute":   { "standard": 3, "cheap": 2 },
-    "summarize": { "cheap": 5 }
-  },
-  "AgentDowngradesTotal": {
-    "planning_standard_sla_constrained": 1
-  },
-  "AgentHardStopsTotal": 1,
-  "AgentCostTotal": 0.195,
-  "AgentCostSaved": 0.075,
-  "SLAViolationsPrevented": 2
-}
-```
-
-> Metrics are in-memory and reset on service restart.
-
----
-
-### POST /v1/chat/completions (gateway)
-
-The gateway also works as a standalone OpenAI-compatible proxy with PII enforcement. Use it as a drop-in replacement for any OpenAI client by pointing `base_url` at `http://localhost:8082`.
-
-**Request:** standard OpenAI chat completions format.
-
-```json
-{
-  "model": "deepseek-chat",
-  "messages": [
-    { "role": "user", "content": "Send report to jane.smith@corp.com" }
-  ],
-  "max_tokens": 512
-}
-```
-
-**Redact mode** (`BLOCK_ON_PII=false`, default): PII is replaced before forwarding. The LLM receives `"Send report to [REDACTED]"`. The full audit entry is written to `audit.jsonl`.
-
-**Block mode** (`BLOCK_ON_PII=true`):
-
-```
-HTTP 403 Forbidden
-```
-
-```json
-{
-  "error": {
-    "type": "pii_violation",
-    "code": "pii_detected",
-    "message": "PII detected: [email]. Request blocked.",
-    "pii_types": ["email"]
-  }
-}
-```
-
----
-
-### GET /health
-
-Available on all three backend services (`agent-executor`, `policy-engine`, `gateway`). Returns `{"status": "healthy"}`.
-
----
-
-## Audit Log
-
-The gateway writes one JSON line to `audit.jsonl` (or `$AUDIT_LOG_PATH`) for every request:
-
-```json
-{
-  "timestamp": "2026-03-08T00:42:28Z",
-  "model": "deepseek-coder",
-  "prompt": "Send report to [REDACTED] and call +44 7911 123456",
-  "response": "Here is a plan for sending the report...",
-  "pii_detected": ["email"],
-  "blocked": false
-}
-```
-
-The `prompt` field always contains the **redacted** text — raw PII is never written to the log.
-
----
-
-## PII Detection
-
-The following patterns are detected and redacted/blocked:
-
-| Type | Example |
-|---|---|
-| Email | `jane.smith@corp.com` → `[REDACTED]` |
-| SSN | `123-45-6789` → `[REDACTED]` |
-| Credit card | `4111 1111 1111 1111` → `[REDACTED]` |
-| Phone | `555-867-5309` → `[REDACTED]` |
-
-> Phone detection uses a 10-digit US format regex. UK numbers (`+44 7911 123456`) are not currently matched — add patterns in `services/gateway/internal/scanner/pii.go`.
-
----
-
-## Model Tiers
-
-| Tier | Model | Cost (simulated) | Latency (simulated) | Default for |
-|---|---|---|---|---|
-| `cheap` | `deepseek-chat` | $0.005 | 80ms | summarize |
-| `standard` | `deepseek-chat` | $0.015 | 200ms | execute |
-| `premium` | `deepseek-coder` | $0.030 | 450ms | plan |
-
-The policy engine may downgrade a step to a lower tier when budget or latency constraints are tight. Downgrades are recorded in metrics.
-
----
-
-## Integration Guide
-
-### This is not an agent framework
-
-You do **not** rewrite your agent. You call `/agent/run` to have the engine orchestrate steps, or call `/policy/evaluate` directly to get a tier decision and execute the LLM call yourself.
-
-### Example: Python integration
-
-```python
-import requests
-
-resp = requests.post(
-    "http://localhost:8081/agent/run",
-    json={
-        "goal": "Summarize support tickets for Q1",
-        "budget": 0.05,
-        "latency_sla_ms": 150,
-    }
-)
-
-result = resp.json()
-
-# Check for PII block
-if resp.status_code == 422:
-    print("Blocked:", result["error"]["pii_types"])
-else:
-    for step in result["steps"]:
-        tier = step["model_tier"]
-        model = {
-            "cheap":    "deepseek-chat",
-            "standard": "deepseek-chat",
-            "premium":  "deepseek-coder",
-        }[tier]
-        # use model for your own LLM call
-```
-
-### Example: use the gateway as a standalone PII proxy
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="your_deepseek_key",
-    base_url="http://localhost:8082/v1",  # point at gateway
-)
-
-response = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[{"role": "user", "content": "Email john@example.com the Q1 report"}],
-)
-# PII is redacted before the request reaches DeepSeek
-```
-
-Your agent keeps its own prompts, tools, memory, and orchestration logic. This engine governs cost, latency, and data safety.
-
----
-
-## Repository Layout
-
-```
-services/
-├── agent-executor/          # Step orchestration, policy enforcement, gateway routing
-│   ├── cmd/server/          # HTTP server entry point
-│   └── internal/
-│       ├── agent/           # Runner, step graph
-│       ├── gatewayclient/   # HTTP client for the PII gateway
-│       ├── handlers/        # HTTP handlers
-│       ├── llmclient/       # Direct LLM client (fallback when no gateway)
-│       ├── metrics/         # Runtime counters
-│       ├── policyclient/    # HTTP client for the policy engine
-│       └── types/           # Shared request/response types
-│
-├── gateway/                 # PII scanning proxy
-│   ├── cmd/server/          # HTTP server entry point
-│   └── internal/
-│       ├── logger/          # Structured audit log (JSONL)
-│       └── scanner/         # PII regex patterns (canonical, single source of truth)
-│
-├── mcp-server/              # Web search tool via Brave Search API
-│   └── cmd/server/          # HTTP server entry point
-│
-├── policy-engine/           # Budget and latency policy evaluation
-│   ├── cmd/server/          # HTTP server entry point
-│   └── internal/
-│       ├── handlers/        # HTTP handlers
-│       ├── policy/          # Evaluator
-│       └── types/           # Policy context types
-│
-└── _docker/
-    └── go-service.Dockerfile  # Shared Dockerfile for all Go services
-
-dashboard/                   # Web UI (port 3000)
-```
-
----
-
-## Troubleshooting
-
-**Services won't start:**
-```bash
-docker compose logs agent-executor
-docker compose logs policy-engine
-docker compose logs gateway
-docker compose logs mcp-server
-```
-
-**`DEEPSEEK_API_KEY` missing error:**
-Make sure `.env` exists at the repo root (not inside a service subdirectory) and contains `DEEPSEEK_API_KEY=your_key_here`. Docker Compose reads the root `.env` automatically.
-
-**`agent-executor` starts but can't reach `gateway` or `policy-engine`:**
-This can happen if the dependent services haven't finished starting yet. Docker Compose waits for them to start (not to be healthy) by default. Wait a few seconds and retry, or add healthchecks to your `docker-compose.yml` — see the `depends_on` / `condition: service_healthy` pattern in the Docker Compose docs.
-
-**Web search not working in agent steps:**
-`mcp-server` starts without a `BRAVE_SEARCH_API_KEY` but search calls will fail silently. Add `BRAVE_SEARCH_API_KEY=your_key` to your `.env` to enable it.
-
-**Policy engine returns `latency_sla_unachievable`:**
-Your `latency_sla_ms` is too low for any available model tier. The minimum is 80ms (for `cheap`). Raise the SLA value or accept that the step will be skipped.
-
-**All steps use `cheap` / budget exhausted immediately:**
-Check that your `budget` value is large enough. Three steps at minimum cost is `3 × $0.005 = $0.015`. A budget below `$0.016` will be exhausted before `execute` completes.
-
-**Metrics show zero after restart:**
-Expected — metrics are in-memory and reset on restart. This is a known limitation.
-
----
-
-## What This System Does NOT Do
-
-- Manage prompts or memory
-- Replace agent frameworks (LangChain, CrewAI, etc.)
-- Persist agent state between runs
-
-> This is intentional — it stays focused on infrastructure concerns: cost, latency, and data safety.
-
----
-
-## Contributing
-
-- Open issues or pull requests
-- Keep services small and composable
-- Prefer explicit logic over implicit behavior
-- New PII patterns go in `services/gateway/internal/scanner/pii.go` — this is the single source of truth used by both the gateway proxy and the agent pipeline
+## Known Implementation Notes
+
+- The root Docker Compose file still contains legacy Go services. They are not
+  part of the active Project Brain runtime.
+- `dashboard/vite.config.js` correctly proxies `/api` to `localhost:8084` for
+  development.
+- `dashboard/nginx.conf` currently proxies `/api` to `agent-executor:8081`.
+  Update it to `chat-agent:8084` before using the Dockerized dashboard for
+  Project Brain.
+- The extension has UI support for retrying failed actions, but the FastAPI
+  route `/actions/{action_id}/retry` is not currently implemented.
+- `briefing.py` attempts a best-effort RAG lookup with a vector-store interface
+  that does not match the current `VectorStore`; structured briefing data still
+  works, but briefing RAG context should be corrected.
+- Google Drive integration is not implemented in the current codebase.
+
+## Security and Privacy Boundaries
+
+- Conversation history and structured transcript data are stored locally in
+  SQLite.
+- Semantic vectors and document chunks are stored locally in Qdrant.
+- Embeddings use local Ollama by default.
+- Chat completion can be local Ollama or a configured external
+  OpenAI-compatible provider.
+- Jira/GitHub sync and comment approval call external APIs only when configured.
+- Human approval is required before the assistant writes comments to Jira or
+  GitHub.
+- CORS is permissive because the active backend is intended to run on localhost.
+
+## Active Scope
+
+Project Brain is the active scope of this repository:
+
+- FastAPI chat-agent
+- SQLite project and memory storage
+- Qdrant RAG/vector memory
+- Ollama embeddings
+- Optional OpenAI-compatible chat provider
+- Jira/GitHub sync and comment approval
+- React dashboard
+- Chrome extension
+
+The legacy Go execution-engine services remain in the repository for now, but
+new architecture, documentation, and assessment work should focus on the
+chat-agent stack.

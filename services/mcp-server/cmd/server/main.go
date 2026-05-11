@@ -5,10 +5,31 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 
+	"github.com/joho/godotenv"
 	"mcp-server/internal/mcp"
 	"mcp-server/internal/tools"
 )
+
+// findEnvFile walks up from the working directory looking for a .env file.
+func findEnvFile() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		candidate := filepath.Join(dir, ".env")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -27,7 +48,26 @@ func main() {
 	log.SetOutput(os.Stderr)
 	log.SetPrefix("[mcp] ")
 
+	// Load .env by walking up from cwd until we find it.
+	if envFile := findEnvFile(); envFile != "" {
+		if err := godotenv.Load(envFile); err != nil {
+			log.Printf("failed to load %s: %v", envFile, err)
+		} else {
+			log.Printf("loaded env from %s", envFile)
+		}
+	}
+
 	registry := tools.NewRegistry()
+
+	// stdio transport: used when launched as a child process by an MCP client
+	// (e.g. Claude Code, Claude Desktop). Set TRANSPORT=stdio to enable.
+	if os.Getenv("TRANSPORT") == "stdio" {
+		server := mcp.NewServer(registry)
+		if err := server.Serve(os.Stdin, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {

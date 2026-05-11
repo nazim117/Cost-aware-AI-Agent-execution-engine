@@ -16,12 +16,22 @@ import (
 
 // Registry holds shared state (e.g. the memory store) and dispatches tool calls.
 type Registry struct {
-	mem *memoryStore
+	mem    *memoryStore
+	jira   *jiraClient   // nil if JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN not set
+	github *githubClient // nil if GITHUB_TOKEN not set
 }
 
 // NewRegistry constructs a Registry with all tools ready.
+// Jira and GitHub clients are only initialised when the required env vars are present.
 func NewRegistry() *Registry {
-	return &Registry{mem: newMemoryStore()}
+	r := &Registry{mem: newMemoryStore()}
+	if jiraIsConfigured() {
+		r.jira = newJiraClient()
+	}
+	if githubIsConfigured() {
+		r.github = newGitHubClient()
+	}
+	return r
 }
 
 // Definitions returns the full tool list sent to MCP clients on tools/list.
@@ -31,6 +41,12 @@ func (r *Registry) Definitions() []mcp.ToolDefinition {
 	defs = append(defs, webDefinitions()...)
 	defs = append(defs, fileDefinitions()...)
 	defs = append(defs, httpDefinitions()...)
+	if r.jira != nil {
+		defs = append(defs, jiraDefinitions()...)
+	}
+	if r.github != nil {
+		defs = append(defs, githubDefinitions()...)
+	}
 	return defs
 }
 
@@ -62,6 +78,40 @@ func (r *Registry) Call(name string, args map[string]any) (mcp.ToolCallResult, e
 	// http
 	case "http_request":
 		return httpRequest(args)
+
+	// jira
+	case "jira_search_issues":
+		if r.jira == nil {
+			return mcp.ToolCallResult{}, fmt.Errorf("jira is not configured")
+		}
+		return r.jira.searchIssues(args)
+	case "jira_get_issue":
+		if r.jira == nil {
+			return mcp.ToolCallResult{}, fmt.Errorf("jira is not configured")
+		}
+		return r.jira.getIssue(args)
+	case "jira_add_comment":
+		if r.jira == nil {
+			return mcp.ToolCallResult{}, fmt.Errorf("jira is not configured")
+		}
+		return r.jira.addComment(args)
+
+	// github
+	case "github_list_issues":
+		if r.github == nil {
+			return mcp.ToolCallResult{}, fmt.Errorf("github is not configured")
+		}
+		return r.github.listIssues(args)
+	case "github_get_issue":
+		if r.github == nil {
+			return mcp.ToolCallResult{}, fmt.Errorf("github is not configured")
+		}
+		return r.github.getIssue(args)
+	case "github_add_comment":
+		if r.github == nil {
+			return mcp.ToolCallResult{}, fmt.Errorf("github is not configured")
+		}
+		return r.github.addComment(args)
 
 	default:
 		return mcp.ToolCallResult{}, fmt.Errorf("unknown tool: %q", name)
