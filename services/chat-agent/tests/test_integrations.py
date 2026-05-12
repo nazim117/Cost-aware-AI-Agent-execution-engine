@@ -5,11 +5,9 @@
 #
 # SyncStore tests use a fresh SQLite temp file per test (tmp_path fixture).
 
-import json
 import pytest
 import httpx
 
-from integrations.base import Item
 from integrations.jira import JiraIntegration
 from integrations.github import GitHubIntegration
 from sync import SyncStore

@@ -15,7 +15,7 @@
 # Pagination: /search uses startAt + maxResults.  We page until fewer than
 # maxResults issues are returned (last page).
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 import logging
 
@@ -96,7 +96,7 @@ class JiraIntegration(PMIntegration):
         Each non-empty line becomes its own paragraph node.  This is the
         inverse of _extract_adf_text above.
         """
-        lines = [l for l in text.splitlines() if l]
+        lines = [line for line in text.splitlines() if line]
         if not lines:
             lines = [text]
         paragraphs = [

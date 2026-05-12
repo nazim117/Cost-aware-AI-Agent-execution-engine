@@ -9,7 +9,7 @@ import pytest
 from unittest.mock import AsyncMock
 
 from sync import SyncStore
-from actions import ActionStore, Action, execute_action
+from actions import ActionStore, execute_action
 
 
 # ---------------------------------------------------------------------------

@@ -42,9 +42,6 @@ from projects import SCHEMA_VERSION, Project, ProjectStore
 import rag
 from sync import SyncStore, sync_project
 from transcript import (
-    ActionItem,
-    Decision,
-    Risk,
     TranscriptStore,
     extract_structured,
 )

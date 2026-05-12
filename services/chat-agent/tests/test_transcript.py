@@ -5,7 +5,7 @@
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import sys
 import os
@@ -16,9 +16,6 @@ from transcript import (
     extract_structured,
     _parse_extraction_json,
     TranscriptStore,
-    Decision,
-    ActionItem,
-    Risk,
 )
 
 

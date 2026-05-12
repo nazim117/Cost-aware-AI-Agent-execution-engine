@@ -297,6 +297,7 @@ async def test_source_label_in_prompt():
 
     all_content = " ".join(m["content"] for m in captured_messages)
     assert "jira:KAN-1" in all_content
+    assert resp.status_code != 500
 
 
 # ---------------------------------------------------------------------------

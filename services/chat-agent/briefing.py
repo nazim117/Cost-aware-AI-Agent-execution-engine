@@ -173,7 +173,7 @@ async def _generate_summary(
         parts.append(f"Recent documents mention: {doc_context}")
 
     user_prompt = (
-        f"Briefing data:\n---\n" + "\n".join(parts) + "\n---\n"
+        "Briefing data:\n---\n" + "\n".join(parts) + "\n---\n"
         "Provide a 2-4 sentence summary of this project's current status."
     )
 
