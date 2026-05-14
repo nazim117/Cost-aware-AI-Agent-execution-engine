@@ -25,13 +25,16 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
-from integrations.base import PMIntegration
+from mcp_client import MCPClient
 from projects import ProjectStore
 
 logger = logging.getLogger("uvicorn.error")
 
 # All action types this module knows how to execute.
 VALID_ACTION_TYPES = {"jira:add_comment", "github:add_comment"}
+
+# ref_keys that correspond to known PM tools in the mcp-server.
+_KNOWN_REF_KEYS = {"jira_project_key", "github_repo"}
 
 
 @dataclass
@@ -243,17 +246,14 @@ async def _transition(
 
 async def execute_action(
     action: Action,
-    integrations: dict[str, PMIntegration],
+    mcp: MCPClient,
     project_store: ProjectStore,
 ) -> dict:
-    """Execute an approved action by dispatching to the correct PM integration.
+    """Execute an approved action by calling the appropriate mcp-server tool.
 
-    Returns the result dict from the integration (shape: {id, url, created_at}).
+    Returns the result dict from the tool (shape: {id, url, created_at}).
     Raises on any error — the caller (route handler) is responsible for calling
     mark_failed() if an exception escapes.
-
-    An *integration* is looked up by action.payload['ref_key'], which must
-    match a key in the integrations dict (e.g. "jira_project_key").
     """
     ref_key = action.payload.get("ref_key")
     item_id = action.payload.get("item_id")
@@ -266,38 +266,48 @@ async def execute_action(
     if project is None:
         raise ValueError(f"Project {action.project_id!r} not found")
 
-    integration = integrations.get(ref_key)
-
     # Fallback: the LLM sometimes emits the ref *value* (e.g. "KAN") instead of
-    # the ref *key* name (e.g. "jira_project_key").  If we don't find a direct
-    # match in integrations, search the project's external_refs for an entry
-    # whose value matches ref_key and whose key IS a known integration.
-    if integration is None:
+    # the ref *key* name (e.g. "jira_project_key").  Search the project's
+    # external_refs for an entry whose value matches ref_key.
+    if ref_key not in _KNOWN_REF_KEYS:
         for k, v in (project.external_refs or {}).items():
-            if v == ref_key and k in integrations:
+            if v == ref_key and k in _KNOWN_REF_KEYS:
                 logger.warning(
                     "ref_key %r looks like a ref value; resolved to integration key %r",
                     ref_key, k,
                 )
                 ref_key = k
-                integration = integrations[k]
                 break
 
-    if integration is None:
+    if ref_key not in _KNOWN_REF_KEYS:
         raise ValueError(
-            f"No integration configured for ref_key {ref_key!r}. "
-            "Check that the required environment variables (JIRA_*, GITHUB_TOKEN) are set."
+            f"No PM tool configured for ref_key {ref_key!r}. "
+            "Supported keys: jira_project_key, github_repo."
         )
 
-    ref_value = project.external_refs.get(ref_key)
+    ref_value = (project.external_refs or {}).get(ref_key)
     if not ref_value:
         raise ValueError(
             f"Project {action.project_id!r} has no {ref_key!r} in external_refs"
         )
 
-    external_ref = {ref_key: ref_value}
+    if action.action_type == "jira:add_comment":
+        result = await mcp.call("jira_add_comment", {"key": item_id, "body": body})
+        return {
+            "id": result.get("comment_id", ""),
+            "url": result.get("url", ""),
+            "created_at": result.get("created_at", ""),
+        }
 
-    if action.action_type in ("jira:add_comment", "github:add_comment"):
-        return await integration.add_comment(external_ref, item_id, body)
+    if action.action_type == "github:add_comment":
+        result = await mcp.call(
+            "github_add_comment",
+            {"repo": ref_value, "number": int(item_id), "body": body},
+        )
+        return {
+            "id": str(result.get("comment_id", "")),
+            "url": result.get("url", ""),
+            "created_at": result.get("created_at", ""),
+        }
 
     raise ValueError(f"Unknown action_type {action.action_type!r}")

@@ -16,12 +16,6 @@
 #   them without pytest-asyncio.  The asyncio_mode = "auto" line at the bottom
 #   tells pytest-asyncio to treat every async test function as asyncio without
 #   needing the decorator explicitly, but we add it explicitly here for clarity.
-#
-# Step 5 note:
-#   Every call now takes a project_id.  Tests use "p1" / "p2" as placeholder
-#   project ids — ConversationStore does not validate that they exist (that
-#   is ProjectStore's job); it just partitions storage by whatever string
-#   you give it.
 
 import pytest
 from memory import ConversationStore

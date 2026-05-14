@@ -1,18 +1,20 @@
 # test_actions_api.py — HTTP-level tests for Step 7 action endpoints.
 #
-# Uses FastAPI's TestClient (synchronous ASGI wrapper) with monkeypatched
-# singletons so no Qdrant, Ollama, DeepSeek, or Jira/GitHub calls are made.
+# Uses FastAPI's AsyncClient with monkeypatched singletons so no Qdrant,
+# Ollama, DeepSeek, or mcp-server calls are made.
 #
 # Flow tested:
 #   1. Propose a pending action via POST /projects/{id}/actions.
 #   2. List via GET /projects/{id}/actions?status=pending — see it there.
-#   3. Approve via POST /actions/{id}/approve — integration add_comment called.
+#   3. Approve via POST /actions/{id}/approve — mcp.call dispatched correctly.
 #   4. List pending again — now empty.
 #   5. Reject path: propose → reject → list pending empty.
 
 import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient, ASGITransport
+
+from mcp_client import MCPError
 
 
 FAKE_PROJECT_ID = "proj-api-test"
@@ -25,14 +27,34 @@ _GOOD_PAYLOAD = {
 }
 
 
-class _FakeIntegration:
-    """add_comment returns a fixed dict without hitting the network."""
-    def __init__(self):
-        self.add_comment = AsyncMock(return_value={
-            "id": "cmt-001",
-            "url": "https://example.atlassian.net/browse/ALPHA-99?focusedCommentId=cmt-001",
-            "created_at": "2026-01-01T10:00:00Z",
-        })
+class _FakeMCPClient:
+    """Fake MCPClient for API-level action tests."""
+
+    def __init__(self, responses: list) -> None:
+        self._responses = list(responses)
+        self._calls: list = []
+
+    async def call(self, name: str, arguments: dict) -> dict:
+        self._calls.append((name, arguments))
+        idx = min(len(self._calls) - 1, len(self._responses) - 1)
+        result = self._responses[idx]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+_COMMENT_RESULT = {
+    "comment_id": "cmt-001",
+    "url": "https://example.atlassian.net/browse/ALPHA-99?focusedCommentId=cmt-001",
+    "created_at": "2026-01-01T10:00:00Z",
+}
+
+_FAKE_PROJECT_REFS = {"jira_project_key": "ALPHA"}
+
+
+async def _fake_project_get(pid):
+    from projects import Project
+    return Project(id=pid, name="Test", created_at="2026", external_refs=_FAKE_PROJECT_REFS)
 
 
 # ---------------------------------------------------------------------------
@@ -42,11 +64,9 @@ class _FakeIntegration:
 @pytest.mark.asyncio
 async def test_propose_returns_pending():
     """POST /projects/{id}/actions creates a pending action and returns it."""
-    fake_integration = _FakeIntegration()
-
     with (
         patch("main._require_project", new_callable=AsyncMock),
-        patch("main._integrations", {"jira_project_key": fake_integration}),
+        patch("main._mcp", _FakeMCPClient([])),
     ):
         from main import app
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -78,11 +98,9 @@ async def test_propose_invalid_action_type_returns_400():
 @pytest.mark.asyncio
 async def test_list_pending_shows_proposed_action():
     """GET /projects/{id}/actions?status=pending returns just-proposed action."""
-    fake_integration = _FakeIntegration()
-
     with (
         patch("main._require_project", new_callable=AsyncMock),
-        patch("main._integrations", {"jira_project_key": fake_integration}),
+        patch("main._mcp", _FakeMCPClient([])),
     ):
         from main import app
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -102,20 +120,13 @@ async def test_list_pending_shows_proposed_action():
 
 
 @pytest.mark.asyncio
-async def test_approve_calls_integration_and_returns_executed():
-    """POST /actions/{id}/approve executes the action and returns status=executed."""
-    fake_integration = _FakeIntegration()
-
-    async def _fake_project_get(pid):
-        from projects import Project
-        return Project(
-            id=pid, name="Test", created_at="2026",
-            external_refs={"jira_project_key": "ALPHA"},
-        )
+async def test_approve_calls_mcp_and_returns_executed():
+    """POST /actions/{id}/approve dispatches to mcp.call and returns status=executed."""
+    fake_mcp = _FakeMCPClient([_COMMENT_RESULT])
 
     with (
         patch("main._require_project", new_callable=AsyncMock),
-        patch("main._integrations", {"jira_project_key": fake_integration}),
+        patch("main._mcp", fake_mcp),
         patch("main.project_store.get", side_effect=_fake_project_get),
     ):
         from main import app
@@ -125,31 +136,21 @@ async def test_approve_calls_integration_and_returns_executed():
                 json={"action_type": "jira:add_comment", "payload": _GOOD_PAYLOAD},
             )
             action_id = post_resp.json()["id"]
-
             approve_resp = await client.post(f"/actions/{action_id}/approve")
 
     assert approve_resp.status_code == 200
     body = approve_resp.json()
     assert body["status"] == "executed"
     assert body["result"]["id"] == "cmt-001"
-    fake_integration.add_comment.assert_called_once()
+    assert fake_mcp._calls[0] == ("jira_add_comment", {"key": "ALPHA-99", "body": "Automated smoke-test comment"})
 
 
 @pytest.mark.asyncio
 async def test_approve_removes_from_pending_list():
     """After approval, the action is no longer in the pending list."""
-    fake_integration = _FakeIntegration()
-
-    async def _fake_project_get(pid):
-        from projects import Project
-        return Project(
-            id=pid, name="Test", created_at="2026",
-            external_refs={"jira_project_key": "ALPHA"},
-        )
-
     with (
         patch("main._require_project", new_callable=AsyncMock),
-        patch("main._integrations", {"jira_project_key": fake_integration}),
+        patch("main._mcp", _FakeMCPClient([_COMMENT_RESULT])),
         patch("main.project_store.get", side_effect=_fake_project_get),
     ):
         from main import app
@@ -173,11 +174,11 @@ async def test_approve_removes_from_pending_list():
 @pytest.mark.asyncio
 async def test_reject_returns_rejected_and_empties_pending():
     """POST /actions/{id}/reject marks rejected; action disappears from pending list."""
-    fake_integration = _FakeIntegration()
+    fake_mcp = _FakeMCPClient([])
 
     with (
         patch("main._require_project", new_callable=AsyncMock),
-        patch("main._integrations", {"jira_project_key": fake_integration}),
+        patch("main._mcp", fake_mcp),
     ):
         from main import app
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -195,30 +196,18 @@ async def test_reject_returns_rejected_and_empties_pending():
 
     assert reject_resp.status_code == 200
     assert reject_resp.json()["status"] == "rejected"
-    # Integration was never called.
-    fake_integration.add_comment.assert_not_called()
+    # mcp.call was never invoked (no approve happened).
+    assert fake_mcp._calls == []
     pending_ids = [a["id"] for a in list_resp.json()]
     assert action_id not in pending_ids
 
 
 @pytest.mark.asyncio
-async def test_approve_integration_failure_returns_502():
-    """When the integration raises, approve returns 502 and action is marked failed."""
-    class _FailingIntegration:
-        add_comment = AsyncMock(side_effect=Exception("401 Unauthorized"))
-
-    failing = _FailingIntegration()
-
-    async def _fake_project_get(pid):
-        from projects import Project
-        return Project(
-            id=pid, name="Test", created_at="2026",
-            external_refs={"jira_project_key": "ALPHA"},
-        )
-
+async def test_approve_mcp_failure_returns_502():
+    """When mcp.call raises, approve returns 502 and action is marked failed."""
     with (
         patch("main._require_project", new_callable=AsyncMock),
-        patch("main._integrations", {"jira_project_key": failing}),
+        patch("main._mcp", _FakeMCPClient([MCPError("401 Unauthorized")])),
         patch("main.project_store.get", side_effect=_fake_project_get),
     ):
         from main import app

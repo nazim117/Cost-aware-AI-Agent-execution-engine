@@ -73,10 +73,14 @@ func (c *jiraClient) searchIssues(args map[string]any) (mcp.ToolCallResult, erro
 	}
 	maxResults := int(optionalFloat(args, "max_results", 20))
 
-	path := fmt.Sprintf("/rest/api/3/issue/search?jql=%s&maxResults=%d&fields=summary,status,assignee",
-		url.QueryEscape(query), maxResults)
-
-	raw, status, err := c.get(path)
+	// Use POST /rest/api/3/search/jql (current Jira Cloud endpoint).
+	// The older GET /rest/api/3/issue/search returns 404 for some tenants.
+	body := map[string]any{
+		"jql":        query,
+		"maxResults": maxResults,
+		"fields":     []string{"summary", "status", "assignee"},
+	}
+	raw, status, err := c.post("/rest/api/3/search/jql", body)
 	if err != nil {
 		return textErr(fmt.Sprintf("jira request failed: %v", err))
 	}

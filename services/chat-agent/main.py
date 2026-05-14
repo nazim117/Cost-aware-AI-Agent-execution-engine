@@ -34,8 +34,7 @@ import httpx
 from actions import ActionStore, Action, execute_action, VALID_ACTION_TYPES
 from config import settings
 from embeddings import embed
-from integrations.github import GitHubIntegration
-from integrations.jira import JiraIntegration
+from mcp_client import MCPClient, MCPError
 from llm import chat, validate_llm_config
 from memory import ConversationStore
 from projects import SCHEMA_VERSION, Project, ProjectStore
@@ -58,19 +57,14 @@ sync_store = SyncStore(settings.sqlite_path)
 action_store = ActionStore(settings.sqlite_path)
 transcript_store = TranscriptStore(settings.sqlite_path)
 
-# Build the integrations registry at startup — only include adapters whose
-# required credentials are present in the environment.  Unconfigured adapters
-# are skipped silently; the sync endpoint logs a warning if a project's
-# external_refs reference a key that has no matching integration.
-_integrations: dict = {}
-if settings.jira_base_url and settings.jira_email and settings.jira_api_token:
-    _integrations["jira_project_key"] = JiraIntegration(
-        base_url=settings.jira_base_url,
-        email=settings.jira_email,
-        api_token=settings.jira_api_token,
-    )
-if settings.github_token:
-    _integrations["github_repo"] = GitHubIntegration(token=settings.github_token)
+# Shared MCPClient — the single gateway to all PM vendor APIs.
+# Credentials (JIRA_*, GITHUB_TOKEN) live on the mcp-server; this service
+# never reads them.  If the mcp-server is unreachable or a tool is not
+# configured, sync/approve return HTTP 502 with a clear error message.
+_mcp = MCPClient(
+    base_url=settings.mcp_base_url,
+    timeout=settings.mcp_timeout_s,
+)
 
 # nomic-embed-text always produces 768-dimensional vectors.
 # This must match the dimension used when the Qdrant collections were created.
@@ -87,6 +81,17 @@ _REFUSAL_MARKERS = (
     "no access to your",
     "i'm unable to access",
     "i am unable to access",
+    # Patterns from knowledge-base refusals (LLM denying data it actually has).
+    "has not appeared in my knowledge",
+    "not appeared in my knowledge",
+    "still cannot write a comment",
+    "cannot write a comment to",
+    "not in my knowledge base",
+    "hasn't appeared in",
+    "has not appeared in",
+    "cannot retrieve",
+    "i cannot retrieve",
+    "still not appeared",
 )
 
 
@@ -450,8 +455,10 @@ async def post_sync(project_id: str):
             external_refs=project.external_refs,
             sync_store=sync_store,
             vstore=vstore,
-            integrations=_integrations,
+            mcp=_mcp,
         )
+    except MCPError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
@@ -552,7 +559,7 @@ async def approve_action(action_id: str):
     action = await action_store.get(action_id)
 
     try:
-        result = await execute_action(action, _integrations, project_store)
+        result = await execute_action(action, _mcp, project_store)
     except Exception as exc:
         error_msg = str(exc)
         await action_store.mark_failed(action_id, error_msg)
@@ -853,6 +860,25 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
 
     # 3b. Search documents collection for relevant chunks (RAG), same filter.
     doc_chunks = await rag.retrieve(req.project_id, req.message, k=3, vstore=vstore)
+
+    # 3c. If the message explicitly names ticket keys (e.g. "KAN-8", "#42"),
+    # fetch those chunks by exact source label and prepend them.  Semantic
+    # search alone misses these when the query is action-oriented ("write a
+    # comment to KAN-8") rather than content-oriented.
+    _jira_keys = re.findall(r'\b([A-Z][A-Z0-9]+-\d+)\b', req.message)
+    _gh_nums   = re.findall(r'#(\d+)', req.message)
+    _pinned_sources = (
+        [f"jira:{k}" for k in _jira_keys]
+        + [f"github:{n}" for n in _gh_nums]
+    )
+    _seen_sources = {c.source for c in doc_chunks}
+    for _src in _pinned_sources:
+        if _src not in _seen_sources:
+            _pinned = await rag.retrieve_by_source(req.project_id, _src, vstore=vstore)
+            if _pinned:
+                doc_chunks = _pinned + doc_chunks
+                _seen_sources.add(_src)
+
     logger.info(
         "RAG[%s]: retrieved %d doc chunks for query %r: %s",
         req.project_id,
@@ -930,14 +956,19 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
                     "authoritative source of truth for this project.\n\n"
                     "Rules:\n"
                     "1. When the user asks about tickets, issues, tasks, status, or "
-                    "   assignees, answer FROM these excerpts.\n"
+                    "   assignees, answer FROM these excerpts. The chunks ARE the "
+                    "   data — they are not pointers to an external system.\n"
                     "2. Cite by reference number, e.g. [1], when you use information "
                     "   from a chunk. You may also include the source label for "
                     "   clarity, e.g. [1][jira:KAN-1].\n"
-                    "3. Never claim you lack access to the user's PM system — the "
-                    "   relevant data is provided to you directly below.\n"
-                    "4. If the excerpts do not contain the answer, say so plainly "
-                    "   and suggest the user run Sync.\n\n"
+                    "3. CRITICAL: If a chunk is present below (e.g. [1] source: "
+                    "   jira:KAN-8), that ticket's data IS available to you. Do NOT "
+                    "   claim the ticket is missing, has not appeared, or that you "
+                    "   cannot access it. Read the chunk and answer from it.\n"
+                    "4. Never say 'it has not appeared in my knowledge base' or "
+                    "   'I cannot retrieve' when the chunk is listed below.\n"
+                    "5. If the excerpts truly do not contain the answer, say so "
+                    "   plainly and suggest the user run Sync.\n\n"
                     "--- PROJECT KNOWLEDGE ---\n"
                     f"{doc_lines}\n"
                     "--- END PROJECT KNOWLEDGE ---"
@@ -965,7 +996,7 @@ async def post_chat(req: ChatRequest) -> ChatResponse:
     live_refs = {
         k
         for k in (project_for_tools.external_refs if project_for_tools else {})
-        if k in _integrations
+        if k in ("jira_project_key", "github_repo")
     }
     if live_refs:
         messages.append(

@@ -282,6 +282,52 @@ class VectorStore:
             ) from exc
         return payloads
 
+    async def fetch_by_source(
+        self, collection: str, project_id: str, source: str
+    ) -> list[Hit]:
+        """Return all stored chunks for a specific source label within one project.
+
+        Used when the user explicitly names a ticket (e.g. "KAN-8") so we can
+        inject its content regardless of semantic similarity score.
+        """
+        payloads: list[dict] = []
+        offset = None
+        src_filter = Filter(
+            must=[
+                FieldCondition(key=PROJECT_ID_KEY, match=MatchValue(value=project_id)),
+                FieldCondition(key="source", match=MatchValue(value=source)),
+            ]
+        )
+        try:
+            while True:
+                results, next_offset = await self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=src_filter,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=100,
+                    offset=offset,
+                )
+                payloads.extend(r.payload for r in results)
+                if next_offset is None:
+                    break
+                offset = next_offset
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Qdrant fetch_by_source failed: {exc}",
+            ) from exc
+        return [
+            Hit(
+                score=1.0,
+                session_id="",
+                role="",
+                content=p.get("text", ""),
+                payload=dict(p),
+            )
+            for p in payloads
+        ]
+
     async def delete_by_source(
         self, collection: str, project_id: str, source: str
     ) -> None:

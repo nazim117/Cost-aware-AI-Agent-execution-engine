@@ -1,5 +1,5 @@
 # PM sync orchestrator.
-
+#
 # Why two tables?
 #   sync_state answers "when did we last sync ref X?" — looked up before each
 #   fetch so we only pull items that changed.
@@ -9,6 +9,16 @@
 # Why is sync logic here and not in main.py?
 #   Keeping orchestration in its own module makes it unit-testable without
 #   a running HTTP server, and keeps main.py as thin route wiring only.
+#
+# PM fetch strategy:
+#   All vendor API calls go through the mcp-server (MCPClient).
+#   jira_project_key → jira_search_issues (list) + jira_get_issue (hydrate each)
+#   github_repo      → github_list_issues (list) + github_get_issue (hydrate each)
+#   Unknown ref_keys are skipped with a warning.
+#
+# Hydration: the list tools return minimal stubs (key/summary/state only).
+#   We call the get-detail tool per item to obtain description and updated_at.
+#   Cap: 50 Jira issues / 100 GitHub issues per sync call.
 
 import json
 import logging
@@ -20,10 +30,13 @@ import aiosqlite
 
 import rag
 from config import settings
-from integrations.base import PMIntegration
+from mcp_client import MCPClient, MCPError
 from vectors import VectorStore
 
 logger = logging.getLogger("uvicorn.error")
+
+_JIRA_MAX_RESULTS = 50
+_GITHUB_MAX_RESULTS = 100
 
 
 @dataclass
@@ -150,24 +163,134 @@ class SyncStore:
             await db.commit()
 
 
+# ---------------------------------------------------------------------------
+# PM fetch helpers — one per supported ref_key type
+# ---------------------------------------------------------------------------
+
+async def _fetch_jira(
+    mcp: MCPClient, project_key: str, updated_since: str | None
+) -> list[dict]:
+    """Fetch Jira issues via jira_search_issues + jira_get_issue per key.
+
+    Returns a list of normalised item dicts with keys:
+    id, title, body, status, assignee, url, updated_at.
+    """
+    jql = f"project = {project_key} ORDER BY updated ASC"
+    if updated_since:
+        jql_date = _jira_date(updated_since)
+        jql = f'project = {project_key} AND updated >= "{jql_date}" ORDER BY updated ASC'
+
+    result = await mcp.call(
+        "jira_search_issues",
+        {"query": jql, "max_results": _JIRA_MAX_RESULTS},
+    )
+    stubs = result.get("issues", [])
+    if not stubs:
+        return []
+
+    items: list[dict] = []
+    for stub in stubs:
+        key = stub.get("key", "")
+        if not key:
+            continue
+        try:
+            detail = await mcp.call("jira_get_issue", {"key": key})
+        except MCPError as exc:
+            logger.warning("jira_get_issue(%s) failed: %s — using stub data", key, exc)
+            detail = {
+                "key": key,
+                "summary": stub.get("summary", ""),
+                "description": "",
+                "status": stub.get("status", ""),
+                "assignee": stub.get("assignee", ""),
+                "url": stub.get("url", ""),
+                "updated": "",
+            }
+        items.append({
+            "id": detail.get("key", key),
+            "title": detail.get("summary", ""),
+            "body": detail.get("description") or "",
+            "status": detail.get("status", ""),
+            "assignee": detail.get("assignee") or None,
+            "url": detail.get("url", ""),
+            "updated_at": detail.get("updated", ""),
+        })
+    return items
+
+
+async def _fetch_github(
+    mcp: MCPClient, repo: str, updated_since: str | None
+) -> list[dict]:
+    """Fetch GitHub issues via github_list_issues + github_get_issue per number.
+
+    The list tool has no `since` parameter, so we filter client-side using
+    created_at as a proxy.  Items created before `updated_since` are skipped;
+    items updated-but-not-recreated after that cutoff will be re-fetched anyway
+    because we always fetch state=all and the issue stays in the list.
+    """
+    result = await mcp.call(
+        "github_list_issues",
+        {"repo": repo, "state": "all", "limit": _GITHUB_MAX_RESULTS},
+    )
+    stubs = result.get("issues", [])
+    if not stubs:
+        return []
+
+    if updated_since:
+        since_dt = _parse_dt(updated_since)
+        stubs = [s for s in stubs if _parse_dt(s.get("created_at", "")) >= since_dt]
+
+    items: list[dict] = []
+    for stub in stubs:
+        number = stub.get("number")
+        if number is None:
+            continue
+        try:
+            detail = await mcp.call("github_get_issue", {"repo": repo, "number": number})
+        except MCPError as exc:
+            logger.warning(
+                "github_get_issue(%s#%s) failed: %s — using stub data", repo, number, exc
+            )
+            detail = {
+                "number": number,
+                "title": stub.get("title", ""),
+                "body": "",
+                "state": stub.get("state", ""),
+                "url": stub.get("url", ""),
+                "updated_at": stub.get("created_at", ""),
+            }
+        items.append({
+            "id": str(detail.get("number", number)),
+            "title": detail.get("title", ""),
+            "body": detail.get("body") or "",
+            "status": detail.get("state", ""),
+            "assignee": detail.get("assignee") or None,
+            "url": detail.get("url", ""),
+            "updated_at": detail.get("updated_at", ""),
+        })
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
 async def sync_project(
     project_id: str,
     external_refs: dict,
     sync_store: SyncStore,
     vstore: VectorStore,
-    integrations: dict[str, PMIntegration],
+    mcp: MCPClient,
 ) -> list[SyncResult]:
-    """Sync all configured PM integrations for one project.
+    """Sync all configured PM refs for one project through the mcp-server.
 
     Args:
-        project_id:     The project whose brain to fill.
-        external_refs:  project.external_refs dict, e.g.
-                        {"jira_project_key": "ALPHA", "github_repo": "org/r"}.
-        sync_store:     Manages last_synced_at and the actions audit log.
-        vstore:         Qdrant store for ingesting item text as vectors.
-        integrations:   Maps ref_key → PMIntegration instance.  Only keys
-                        that appear in external_refs AND in this dict are synced.
-                        Unconfigured integrations are silently skipped.
+        project_id:    The project whose brain to fill.
+        external_refs: project.external_refs dict, e.g.
+                       {"jira_project_key": "ALPHA", "github_repo": "org/r"}.
+        sync_store:    Manages last_synced_at and the actions audit log.
+        vstore:        Qdrant store for ingesting item text as vectors.
+        mcp:           Shared MCPClient — the single gateway to all PM vendor APIs.
 
     Returns:
         One SyncResult per ref that was synced.
@@ -176,18 +299,6 @@ async def sync_project(
     results: list[SyncResult] = []
 
     for ref_key, ref_value in external_refs.items():
-        integration = integrations.get(ref_key)
-        if integration is None:
-            # This ref_key does not have a configured integration — skip.
-            # (e.g. the project has a jira_project_key but JIRA_* env vars
-            # are not set, so the JiraIntegration was not instantiated.)
-            logger.warning(
-                "No integration configured for ref_key %r — skipping (project %s)",
-                ref_key,
-                project_id,
-            )
-            continue
-
         last_synced = await sync_store.get_last_synced(
             project_id, ref_key, str(ref_value)
         )
@@ -197,36 +308,36 @@ async def sync_project(
             ref_key, ref_value, project_id, last_synced or "never",
         )
 
-        items = await integration.fetch_items(
-            {ref_key: ref_value},
-            updated_since=last_synced,
-        )
+        if ref_key == "jira_project_key":
+            items = await _fetch_jira(mcp, str(ref_value), last_synced)
+        elif ref_key == "github_repo":
+            items = await _fetch_github(mcp, str(ref_value), last_synced)
+        else:
+            logger.warning(
+                "No PM tool configured for ref_key %r — skipping (project %s)",
+                ref_key, project_id,
+            )
+            continue
 
         total_chunks = 0
         for item in items:
-            # Build a stable source label so repeated syncs of the same item
-            # are identifiable and can be deduplicated in the future.
             if ref_key == "jira_project_key":
-                source = f"jira:{item.id}"
+                source = f"jira:{item['id']}"
             else:
-                source = f"github:{ref_value}#{item.id}"
+                source = f"github:{ref_value}#{item['id']}"
 
-            # Delete any existing vectors for this item before re-ingesting.
-            # Without this, every sync appends new duplicate chunks instead of
-            # replacing the old ones.  Also handles the case where a ticket's
-            # body shrank — the old extra chunks disappear cleanly.
+            # Delete existing vectors before re-ingesting so repeated syncs
+            # replace old chunks rather than accumulating duplicates.
             await vstore.delete_by_source(
                 settings.qdrant_docs_collection, project_id, source
             )
 
-            # Combine all useful fields into a single text block for ingestion.
-            # The LLM will see this text when the chunk is retrieved by RAG.
-            text_parts = [item.title, f"Status: {item.status}"]
-            if item.assignee:
-                text_parts.append(f"Assignee: {item.assignee}")
-            if item.body:
-                text_parts.append(item.body)
-            text_parts.append(f"URL: {item.url}")
+            text_parts = [item["title"], f"Status: {item['status']}"]
+            if item.get("assignee"):
+                text_parts.append(f"Assignee: {item['assignee']}")
+            if item.get("body"):
+                text_parts.append(item["body"])
+            text_parts.append(f"URL: {item['url']}")
             text = "\n\n".join(text_parts)
 
             n = await rag.ingest(project_id, source, text, vstore)
@@ -260,3 +371,27 @@ async def sync_project(
         )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+
+def _jira_date(iso: str) -> str:
+    """Convert ISO-8601 string to Jira JQL date format (YYYY-MM-DD HH:mm)."""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso
+
+
+def _parse_dt(iso: str) -> datetime:
+    """Parse ISO-8601 to a UTC-aware datetime; returns datetime.min on failure."""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, AttributeError):
+        return datetime.min.replace(tzinfo=timezone.utc)

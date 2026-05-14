@@ -6,10 +6,10 @@
 # execute_action tests use a FakePMIntegration to avoid any network calls.
 
 import pytest
-from unittest.mock import AsyncMock
 
 from sync import SyncStore
 from actions import ActionStore, execute_action
+from mcp_client import MCPError
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +203,20 @@ async def test_delete_by_project_only_removes_target(stores):
 # execute_action
 # ---------------------------------------------------------------------------
 
-class _FakeIntegration:
-    """Minimal PMIntegration stand-in for execute_action tests."""
-    def __init__(self):
-        self.add_comment = AsyncMock(return_value={
-            "id": "cmt-99", "url": "https://example.com/comment/99", "created_at": "2026-01-01"
-        })
+class _FakeMCPClient:
+    """Fake MCPClient for execute_action tests."""
+
+    def __init__(self, responses: list[dict]) -> None:
+        self._responses = list(responses)
+        self._calls: list[tuple[str, dict]] = []
+
+    async def call(self, name: str, arguments: dict) -> dict:
+        self._calls.append((name, arguments))
+        idx = min(len(self._calls) - 1, len(self._responses) - 1)
+        result = self._responses[idx]
+        if isinstance(result, MCPError):
+            raise result
+        return result
 
 
 class _FakeProjectStore:
@@ -223,6 +231,7 @@ class _FakeProjectStore:
 
 
 async def test_execute_action_jira_comment(stores):
+    """Jira add_comment calls jira_add_comment with the correct key and body."""
     _, astore = stores
     action_id = await astore.create_pending(
         "proj-1", "jira:add_comment",
@@ -231,33 +240,47 @@ async def test_execute_action_jira_comment(stores):
     await astore.approve(action_id)
     action = await astore.get(action_id)
 
-    fake = _FakeIntegration()
-    result = await execute_action(
-        action,
-        integrations={"jira_project_key": fake},
-        project_store=_FakeProjectStore(),
-    )
+    mcp = _FakeMCPClient([{"comment_id": "cmt-99", "url": "https://example.com/comment/99", "created_at": "2026-01-01"}])
+    result = await execute_action(action, mcp=mcp, project_store=_FakeProjectStore())
 
     assert result["id"] == "cmt-99"
-    fake.add_comment.assert_called_once_with(
-        {"jira_project_key": "ALPHA"}, "ALPHA-5", "Test comment"
-    )
+    assert mcp._calls[0] == ("jira_add_comment", {"key": "ALPHA-5", "body": "Test comment"})
 
 
-async def test_execute_action_missing_integration_raises(stores):
+async def test_execute_action_github_comment(stores):
+    """GitHub add_comment calls github_add_comment with repo + number."""
     _, astore = stores
     action_id = await astore.create_pending(
-        "proj-1", "jira:add_comment",
-        {"item_id": "ALPHA-5", "body": "b", "ref_key": "jira_project_key"},
+        "proj-1", "github:add_comment",
+        {"item_id": "42", "body": "LGTM", "ref_key": "github_repo"},
     )
     await astore.approve(action_id)
     action = await astore.get(action_id)
 
-    with pytest.raises(ValueError, match="No integration configured"):
-        await execute_action(action, integrations={}, project_store=_FakeProjectStore())
+    mcp = _FakeMCPClient([{"comment_id": 77, "url": "https://github.com/org/repo/issues/42#issuecomment-77", "created_at": "2026-01-01"}])
+    result = await execute_action(action, mcp=mcp, project_store=_FakeProjectStore())
+
+    assert result["id"] == "77"
+    assert mcp._calls[0] == ("github_add_comment", {"repo": "org/repo", "number": 42, "body": "LGTM"})
+
+
+async def test_execute_action_unknown_ref_key_raises(stores):
+    """Unknown ref_key not resolvable from external_refs raises ValueError."""
+    _, astore = stores
+    action_id = await astore.create_pending(
+        "proj-1", "jira:add_comment",
+        {"item_id": "ALPHA-5", "body": "b", "ref_key": "unknown_key"},
+    )
+    await astore.approve(action_id)
+    action = await astore.get(action_id)
+
+    mcp = _FakeMCPClient([])
+    with pytest.raises(ValueError, match="No PM tool configured"):
+        await execute_action(action, mcp=mcp, project_store=_FakeProjectStore())
 
 
 async def test_execute_action_missing_ref_key_raises(stores):
+    """Action with ref_key missing from project external_refs raises ValueError."""
     _, astore = stores
     action_id = await astore.create_pending(
         "proj-1", "jira:add_comment",
@@ -271,12 +294,9 @@ async def test_execute_action_missing_ref_key_raises(stores):
             from projects import Project
             return Project(id=pid, name="X", created_at="2026", external_refs={})
 
+    mcp = _FakeMCPClient([])
     with pytest.raises(ValueError, match="has no 'jira_project_key'"):
-        await execute_action(
-            action,
-            integrations={"jira_project_key": _FakeIntegration()},
-            project_store=_ProjectNoRefs(),
-        )
+        await execute_action(action, mcp=mcp, project_store=_ProjectNoRefs())
 
 
 pytestmark = pytest.mark.asyncio

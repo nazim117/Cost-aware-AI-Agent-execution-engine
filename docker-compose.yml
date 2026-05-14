@@ -36,6 +36,10 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8083:8083"
+    # Load PM credentials from the repo-root .env so the chat-agent never
+    # reads them directly.  JIRA_* and GITHUB_TOKEN stay on this service.
+    env_file:
+      - .env
     environment:
       - PORT=8083
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
@@ -91,10 +95,13 @@ services:
       # host.docker.internal is a special DNS name that Docker resolves to the
       # host machine's IP address from inside a container.
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      # PM I/O is routed through the mcp-server; chat-agent holds no vendor creds.
+      - MCP_BASE_URL=http://mcp-server:8083
     volumes:
       - chat-db:/data
     depends_on:
       - qdrant
+      - mcp-server
     restart: unless-stopped
 
   # qdrant — vector database for semantic memory (Step 2+).

@@ -212,7 +212,6 @@ async def test_draft_action_tag_replaced_with_marker():
             id=FAKE_PROJECT_ID,
             external_refs={"jira_project_key": "KAN"},
         )),
-        patch("main._integrations", {"jira_project_key": object()}),
     ):
         from main import app
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -252,7 +251,6 @@ async def test_malformed_draft_action_tag_stripped_silently():
             id=FAKE_PROJECT_ID,
             external_refs={"jira_project_key": "KAN"},
         )),
-        patch("main._integrations", {"jira_project_key": object()}),
     ):
         from main import app
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

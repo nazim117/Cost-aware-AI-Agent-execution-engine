@@ -152,6 +152,32 @@ async def list_sources(
     return [SourceSummary(source=s, chunks=c) for s, c in sorted(counts.items())]
 
 
+async def retrieve_by_source(
+    project_id: str,
+    source: str,
+    vstore: VectorStore,
+) -> list[Chunk]:
+    """Return all stored chunks for an exact source label (e.g. 'jira:KAN-8').
+
+    Used when the user explicitly references a ticket key so the LLM always
+    gets that ticket's content regardless of semantic similarity.
+    """
+    hits = await vstore.fetch_by_source(
+        collection=settings.qdrant_docs_collection,
+        project_id=project_id,
+        source=source,
+    )
+    return [
+        Chunk(
+            score=h.score,
+            source=h.payload.get("source", ""),
+            chunk_index=h.payload.get("chunk_index", 0),
+            text=h.payload.get("text", ""),
+        )
+        for h in hits
+    ]
+
+
 async def retrieve(
     project_id: str,
     query: str,
