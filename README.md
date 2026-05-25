@@ -42,15 +42,22 @@ flowchart LR
   ChatAgent --> Web["YouTube/Wikipedia/URLs"]
 ```
 
-### Main Containers
+### Active Containers
+
+These are the only services needed to run Project Brain:
 
 | Container | Path | Responsibility |
 |---|---|---|
 | chat-agent | `services/chat-agent/` | FastAPI backend for projects, chat, RAG, memory, sync, transcript processing, and action approval |
+| mcp-server | `services/mcp-server/` | Go service that holds Jira/GitHub credentials and proxies PM tool calls — chat-agent calls this, never the vendor APIs directly |
 | qdrant | Docker image `qdrant/qdrant` | Vector database for conversation and document embeddings |
-| dashboard | `dashboard/` | React UI for projects, chat, sources, sync, pending actions, transcript outputs, and briefings |
+| dashboard | `dashboard/` | React UI — **run with `npm run dev` (port 5173), not via Docker Compose** |
 | extension | `extension/` | Chrome side panel for chatting, ingesting current pages, syncing, and approving actions |
 | ollama | host service | Local embedding model and optional local chat model |
+
+### Legacy Containers (not used)
+
+`docker compose up` without arguments also starts `policy-engine`, `gateway`, and `agent-executor`. These are legacy Go services from the original cost-aware execution engine. They do nothing in the current Project Brain workflow. Start only the services you need (see Quick Start).
 
 ## Repository Layout
 
@@ -297,11 +304,16 @@ If using local Ollama chat:
 ollama pull llama3
 ```
 
-### 1. Start Qdrant
+### 1. Start Qdrant and mcp-server
 
 ```bash
-docker compose up qdrant -d
+docker compose up qdrant mcp-server -d
 ```
+
+`mcp-server` holds your Jira and GitHub credentials. `chat-agent` calls it for
+all PM tool operations. Do **not** use `docker compose up` without arguments —
+that also starts the unused legacy services (`policy-engine`, `gateway`,
+`agent-executor`) and a broken dashboard container.
 
 ### 2. Start chat-agent
 
@@ -352,13 +364,16 @@ npm run lint
 
 ## Known Implementation Notes
 
-- The root Docker Compose file still contains legacy Go services. They are not
-  part of the active Project Brain runtime.
+- `mcp-server` (Go, port 8083) is an **active** dependency — `chat-agent` routes
+  all Jira/GitHub calls through it. Always start it alongside Qdrant.
+- `policy-engine`, `gateway`, and `agent-executor` are legacy Go services. They
+  are kept in the repo but play no role in the current runtime. Do not start them.
 - `dashboard/vite.config.js` correctly proxies `/api` to `localhost:8084` for
   development.
-- `dashboard/nginx.conf` currently proxies `/api` to `agent-executor:8081`.
-  Update it to `chat-agent:8084` before using the Dockerized dashboard for
-  Project Brain.
+- The `dashboard` Docker Compose service (port 3000) has a broken `nginx.conf`
+  that proxies `/api` to the legacy `agent-executor:8081`. **Do not use it.**
+  Always run the dashboard with `npm run dev` (port 5173) — that config is
+  correct and proxies `/api` to `chat-agent:8084`.
 - The extension has UI support for retrying failed actions, but the FastAPI
   route `/actions/{action_id}/retry` is not currently implemented.
 - `briefing.py` attempts a best-effort RAG lookup with a vector-store interface
