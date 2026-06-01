@@ -10,13 +10,20 @@ on:
     paths:
       - 'extension/**'
 
+concurrency:
+  group: ci-extension-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   validate-and-package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: 'lts/*'
 
@@ -30,7 +37,7 @@ jobs:
         run: zip -r extension.zip extension/ -x "extension/*.md"
 
       - name: Upload extension artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: chrome-extension
           path: extension.zip

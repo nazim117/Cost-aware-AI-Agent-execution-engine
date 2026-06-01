@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -8,7 +9,12 @@ import (
 	"path/filepath"
 
 	"github.com/joho/godotenv"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"mcp-server/internal/mcp"
+	"mcp-server/internal/observability"
 	"mcp-server/internal/tools"
 )
 
@@ -61,12 +67,30 @@ func main() {
 
 	// stdio transport: used when launched as a child process by an MCP client
 	// (e.g. Claude Code, Claude Desktop). Set TRANSPORT=stdio to enable.
+	// We skip tracing in stdio mode — there is no HTTP layer, and the parent
+	// process manages the lifetime of the child.
 	if os.Getenv("TRANSPORT") == "stdio" {
 		server := mcp.NewServer(registry)
 		if err := server.Serve(os.Stdin, os.Stdout); err != nil {
 			log.Fatal(err)
 		}
 		return
+	}
+
+	// ── Tracing ────────────────────────────────────────────────────────────────
+	// InitTracer is a no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset, so the
+	// service starts cleanly without a collector in local non-Docker runs.
+	ctx := context.Background()
+	shutdown, err := observability.InitTracer(ctx)
+	if err != nil {
+		log.Printf("tracing init failed (continuing without traces): %v", err)
+	} else {
+		// Flush pending spans on shutdown so nothing is dropped on SIGTERM.
+		defer func() {
+			if err := shutdown(ctx); err != nil {
+				log.Printf("tracer shutdown error: %v", err)
+			}
+		}()
 	}
 
 	port := os.Getenv("PORT")
@@ -87,6 +111,11 @@ func main() {
 	})
 
 	// POST /tools/call — invoke a tool by name.
+	//
+	// A child span "tool.<name>" is started here so that Jaeger shows the exact
+	// tool name (e.g. "tool.jira_search_issues") rather than a generic "POST".
+	// The span is a child of the incoming traceparent injected by chat-agent's
+	// httpx auto-instrumentation — linking this execution to the /chat trace.
 	mux.HandleFunc("/tools/call", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -99,13 +128,25 @@ func main() {
 			return
 		}
 
+		// Start a span named after the tool so the waterfall view in Jaeger
+		// shows exactly which vendor API was called.
+		tracer := otel.Tracer("mcp-server")
+		spanCtx, span := tracer.Start(r.Context(), "tool."+params.Name)
+		span.SetAttributes(attribute.String("tool.name", params.Name))
+		defer span.End()
+
 		result, err := registry.Call(params.Name, params.Arguments)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			result = mcp.ToolCallResult{
 				Content: []mcp.ContentBlock{{Type: "text", Text: err.Error()}},
 				IsError: true,
 			}
 		}
+
+		// Use spanCtx so the encode step is still within the span's context.
+		_ = spanCtx
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
@@ -118,5 +159,11 @@ func main() {
 	})
 
 	log.Printf("MCP server listening on :%s (tools: %d)", port, len(registry.Definitions()))
-	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
+
+	// otelhttp.NewHandler wraps the entire mux with:
+	//   1. traceparent / tracestate header extraction (W3C TraceContext)
+	//   2. a root span for every incoming request named "mcp-server"
+	// This is what connects the Python→Go trace — the extracted context becomes
+	// the parent of any spans we start inside the handlers above.
+	log.Fatal(http.ListenAndServe(":"+port, otelhttp.NewHandler(corsMiddleware(mux), "mcp-server")))
 }

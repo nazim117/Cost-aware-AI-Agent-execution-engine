@@ -1,0 +1,71 @@
+name: Vulnerability Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Weekly on Mondays at 14:30 UTC — offset from CodeQL cron (Fridays 14:20) to
+    # spread GitHub Actions queue load.
+    - cron: '30 14 * * 1'
+
+concurrency:
+  group: vuln-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required to upload SARIF findings to the GitHub Security tab.
+  security-events: write
+
+jobs:
+  trivy-fs:
+    name: Trivy — filesystem CVE scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy (filesystem)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-fs.sarif
+          # ignore-unfixed keeps noise low — only report CVEs with an available fix.
+          ignore-unfixed: true
+          # exit-code 0 so PRs are not blocked until we establish a clean baseline.
+          # Flip to exit-code: '1' when ready to enforce.
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  trivy-config:
+    name: Trivy — IaC / config scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy (config / IaC)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: '0'
+
+      - name: Upload config SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config

@@ -10,6 +10,13 @@ on:
     paths:
       - 'services/chat-agent/**'
 
+concurrency:
+  group: ci-chat-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
@@ -17,9 +24,9 @@ jobs:
       run:
         working-directory: services/chat-agent
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
@@ -39,7 +46,7 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Build Docker image
+      - name: Build Docker image (smoke test)
         run: docker build -t chat-agent:ci services/chat-agent

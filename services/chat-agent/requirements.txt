@@ -15,3 +15,12 @@ python-docx==1.1.2
 faster-whisper==1.1.0
 youtube-transcript-api==0.6.3
 trafilatura==2.0.0
+# Observability — OpenTelemetry tracing + structured logging
+# SDK: core API + in-process tracing machinery
+opentelemetry-sdk==1.27.0
+# OTLP/HTTP exporter — ships spans to Jaeger (or any OTLP collector)
+opentelemetry-exporter-otlp-proto-http==1.27.0
+# Auto-instrumentation: FastAPI routes + httpx outbound calls
+# Note: instrumentation package versions are independent from the SDK version
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-instrumentation-httpx==0.48b0

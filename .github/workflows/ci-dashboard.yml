@@ -10,6 +10,13 @@ on:
     paths:
       - 'dashboard/**'
 
+concurrency:
+  group: ci-dashboard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   lint-and-build:
     runs-on: ubuntu-latest
@@ -17,9 +24,9 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: 'lts/*'
           cache: 'npm'
@@ -35,7 +42,7 @@ jobs:
         run: npm run build
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: dashboard-dist
           path: dashboard/dist/

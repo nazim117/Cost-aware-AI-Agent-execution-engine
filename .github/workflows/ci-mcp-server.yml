@@ -1,0 +1,73 @@
+name: CI - MCP Server
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'services/mcp-server/**'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'services/mcp-server/**'
+
+# Cancel superseded runs on the same branch/PR to save minutes.
+concurrency:
+  group: ci-mcp-server-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/mcp-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: services/mcp-server/go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Check formatting
+        # gofmt -l lists files that differ from canonical format; fail if any.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run tests (race detector)
+        run: go test ./... -race -v
+
+      - name: govulncheck
+        # Call-graph-aware Go vulnerability check. Catches CVEs that
+        # only matter if the vulnerable code path is actually reachable.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image (smoke test)
+        run: docker build -t mcp-server:ci services/mcp-server

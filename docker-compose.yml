@@ -43,6 +43,12 @@ services:
     environment:
       - PORT=8083
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      # OpenTelemetry: export spans to Jaeger over OTLP/HTTP.
+      # "jaeger" resolves to the Jaeger container on the shared network.
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=mcp-server
+    depends_on:
+      - jaeger
     restart: unless-stopped
 
   agent-executor:
@@ -97,11 +103,34 @@ services:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       # PM I/O is routed through the mcp-server; chat-agent holds no vendor creds.
       - MCP_BASE_URL=http://mcp-server:8083
+      # OpenTelemetry: export spans to Jaeger over OTLP/HTTP.
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=chat-agent
     volumes:
       - chat-db:/data
     depends_on:
       - qdrant
       - mcp-server
+      - jaeger
+    restart: unless-stopped
+
+  # jaeger — distributed tracing backend (local-first, all-in-one image).
+  #
+  # Receives spans from chat-agent and mcp-server over OTLP/HTTP on port 4318.
+  # The web UI on port 16686 lets you view full request waterfalls:
+  #   http://localhost:16686
+  #
+  # "all-in-one" bundles the collector, query service, and UI in one container —
+  # exactly what we need for a local dev/solo setup.  No separate collector or
+  # storage backend required.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    ports:
+      - "16686:16686"   # Jaeger web UI
+      - "4318:4318"     # OTLP/HTTP ingest (what the services export to)
+    environment:
+      # Required to enable the OTLP receiver in Jaeger all-in-one.
+      - COLLECTOR_OTLP_ENABLED=true
     restart: unless-stopped
 
   # qdrant — vector database for semantic memory (Step 2+).

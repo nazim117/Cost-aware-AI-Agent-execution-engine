@@ -23,10 +23,15 @@
 import json
 import logging
 import re
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from opentelemetry import trace
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -39,8 +44,10 @@ from embeddings import embed
 from mcp_client import MCPClient, MCPError
 from llm import chat, validate_llm_config
 from memory import ConversationStore
+from observability import setup_telemetry
 from projects import SCHEMA_VERSION, Project, ProjectStore
 import rag
+from request_context import set_request_id, new_request_id
 from sync import SyncStore, sync_project
 from transcript import (
     TranscriptStore,
@@ -143,6 +150,12 @@ async def lifespan(app: FastAPI):
     # start than to discover a missing API key on the first real user request.
     validate_llm_config()
 
+    # Bootstrap OpenTelemetry tracing + structured JSON logging.
+    # Must run after validate_llm_config() so the TracerProvider is live before
+    # the server accepts any requests.  FastAPIInstrumentor wraps 'app' here so
+    # all routes registered below automatically get a span.
+    setup_telemetry(app)
+
     yield
     # Shutdown: no explicit cleanup needed for either store.
 
@@ -162,6 +175,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Propagate or generate a per-request correlation id.
+
+    Reads the incoming X-Request-ID header (so callers can set their own id,
+    e.g. the Chrome extension could send one).  If absent, generates a UUID-4.
+    The id is:
+      1. Stored in a contextvar so structured log lines pick it up automatically.
+      2. Set as a span attribute "request.id" on the active OTEL span.
+      3. Echoed back in the X-Request-ID response header so callers can correlate
+         their own logs with ours.
+    """
+
+    async def dispatch(
+        self, request: StarletteRequest, call_next
+    ) -> StarletteResponse:
+        req_id = request.headers.get("X-Request-ID") or new_request_id()
+        set_request_id(req_id)
+
+        # Attach to the current OTEL span so Jaeger shows the request-id
+        # alongside the trace — useful when correlating browser logs with traces.
+        span = trace.get_current_span()
+        if span.is_recording():
+            span.set_attribute("request.id", req_id)
+
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
+        return response
+
+
+app.add_middleware(RequestIdMiddleware)
 
 
 # Project CRUD models
