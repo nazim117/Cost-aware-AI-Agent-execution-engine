@@ -21,8 +21,11 @@ export default defineConfig({
   // Retry once on CI to absorb flaky timing issues.
   retries: process.env.CI ? 1 : 0,
 
-  // Limit parallelism in CI to avoid resource contention.
-  workers: process.env.CI ? 2 : undefined,
+  // One worker: tests share a single browser process so route mocks are
+  // never set up in a different context than the page that fires the request.
+  // The suite is small (~17 tests, ~30 s) so parallelism is not worth the
+  // added complexity.
+  workers: 1,
 
   reporter: [
     ['list'],

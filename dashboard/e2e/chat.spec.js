@@ -83,7 +83,9 @@ test.describe('chat flow', () => {
 
     await input.fill('Second question');
     await input.press('Enter');
-    await page.getByTestId('chat-message').last().waitFor();
+    // Wait for exactly 2 messages — `.last().waitFor()` would resolve immediately
+    // because the first message is already visible.
+    await expect(page.getByTestId('chat-message')).toHaveCount(2);
 
     // Two assistant messages should be present.
     const messages = await page.getByTestId('chat-message').all();
