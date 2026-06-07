@@ -149,32 +149,34 @@ def _build_tracer_provider() -> TracerProvider | None:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def setup_telemetry(app: FastAPI) -> None:
-    """Bootstrap all telemetry for the chat-agent service.
+def setup_telemetry() -> None:
+    """Bootstrap logging + tracer provider.
 
-    Call once from the FastAPI lifespan hook, after validate_llm_config() and
-    before the yield.  Must run inside a live event loop (it starts a background
-    export thread).
-
-    Args:
-        app: The FastAPI application instance.  Passed to FastAPIInstrumentor
-             so it can wrap all registered routes.
+    Call at module level in main.py (before app = FastAPI(...)) so the provider
+    is live before instrument_app() and before any requests are accepted.
+    Does NOT touch the FastAPI app — call instrument_app(app) separately.
     """
     _configure_logging(settings.log_level, settings.log_json)
-
-    provider = _build_tracer_provider()
-    if provider is None:
-        # OTEL disabled — still configure logging, skip all instrumentation.
-        return
-
-    # Auto-instrument FastAPI: every route gets a span named after its HTTP method
-    # and path template (e.g. "POST /chat").  Route parameters are captured as
-    # span attributes automatically.
-    FastAPIInstrumentor.instrument_app(app)
+    _build_tracer_provider()
 
     # Auto-instrument httpx: every outbound HTTP call gets a span and the
     # traceparent header is injected.  This single call covers:
     #   - llm.py         (DeepSeek / Ollama calls via httpx.AsyncClient)
     #   - mcp_client.py  (PM tool calls via httpx.AsyncClient → mcp-server)
     #   - extractors.py  (URL fetching via httpx.Client)
-    HTTPXClientInstrumentor().instrument()
+    if settings.otel_enabled:
+        HTTPXClientInstrumentor().instrument()
+
+
+def instrument_app(app: FastAPI) -> None:
+    """Wire FastAPIInstrumentor into the app.
+
+    Must be called at module level, right after app = FastAPI(...) and BEFORE
+    any app.add_middleware() calls.  Starlette raises RuntimeError if middleware
+    is added after the app has started.
+    """
+    if not settings.otel_enabled:
+        return
+    # Auto-instrument FastAPI: every route gets a span named after its HTTP method
+    # and path template (e.g. "POST /chat").
+    FastAPIInstrumentor.instrument_app(app)

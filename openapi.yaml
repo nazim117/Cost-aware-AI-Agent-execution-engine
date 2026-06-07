@@ -7,6 +7,20 @@ info:
 servers:
   - url: http://localhost:8000
 
+tags:
+  - name: projects
+    description: Project CRUD and PM integration sync
+  - name: chat
+    description: Conversational interface to the project brain
+  - name: ingest
+    description: Document and URL ingestion pipeline
+  - name: actions
+    description: Human-approval flow for AI-proposed actions
+  - name: studio
+    description: Extracted decisions, risks, action items, briefings, and standups
+  - name: memory
+    description: Semantic search over conversation memory
+
 paths:
   /health:
     get:
@@ -26,6 +40,7 @@ paths:
 
   /projects:
     get:
+      tags: [projects]
       summary: List all projects
       operationId: listProjects
       responses:
@@ -38,6 +53,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Project"
     post:
+      tags: [projects]
       summary: Create a project
       operationId: createProject
       requestBody:
@@ -47,7 +63,7 @@ paths:
             schema:
               $ref: "#/components/schemas/ProjectCreateRequest"
       responses:
-        "200":
+        "201":
           description: Created project
           content:
             application/json:
@@ -55,9 +71,14 @@ paths:
                 $ref: "#/components/schemas/Project"
         "409":
           description: A project with that name already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}:
     patch:
+      tags: [projects]
       summary: Partial update of a project
       operationId: patchProject
       parameters:
@@ -77,9 +98,18 @@ paths:
                 $ref: "#/components/schemas/Project"
         "404":
           description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
           description: Name already taken
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     delete:
+      tags: [projects]
       summary: Delete a project and all its state
       operationId: deleteProject
       parameters:
@@ -91,28 +121,51 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [deleted]
                 properties:
                   deleted:
                     type: boolean
         "404":
           description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/sync:
     post:
+      tags: [projects]
       summary: Sync PM integrations into the project RAG store
       operationId: syncProject
       parameters:
         - $ref: "#/components/parameters/ProjectId"
       responses:
         "200":
-          description: Sync results
+          description: Sync results per external ref
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResult"
         "400":
           description: No external_refs configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "502":
           description: PM API unreachable or returned an error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     get:
+      tags: [projects]
       summary: Get last-synced timestamps per external ref
       operationId: getSyncStatus
       parameters:
@@ -120,11 +173,20 @@ paths:
       responses:
         "200":
           description: Sync status per ref
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncStatus"
         "404":
           description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/actions:
     post:
+      tags: [actions]
       summary: Propose a pending action for human approval
       operationId: proposeAction
       parameters:
@@ -144,9 +206,18 @@ paths:
                 $ref: "#/components/schemas/Action"
         "400":
           description: Invalid action_type or payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     get:
+      tags: [actions]
       summary: List actions for a project
       operationId: listActions
       parameters:
@@ -155,8 +226,7 @@ paths:
           in: query
           required: false
           schema:
-            type: string
-            example: pending
+            $ref: "#/components/schemas/ActionStatus"
       responses:
         "200":
           description: List of actions
@@ -169,47 +239,72 @@ paths:
 
   /actions/{action_id}/approve:
     post:
+      tags: [actions]
       summary: Approve and execute a pending action
       operationId: approveAction
       parameters:
-        - name: action_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/ActionId"
       responses:
         "200":
           description: Action executed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Action"
         "400":
           description: Action is not pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           description: Action not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "502":
           description: Integration call failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /actions/{action_id}/reject:
     post:
+      tags: [actions]
       summary: Reject a pending action
       operationId: rejectAction
       parameters:
-        - name: action_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/ActionId"
       responses:
         "200":
           description: Action rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Action"
         "400":
           description: Action cannot be rejected in its current state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           description: Action not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /chat:
     post:
+      tags: [chat]
       summary: Send a message to the project brain
+      description: >
+        `project_id` is passed in the request body (not the path) because chat
+        is a stateless endpoint — the caller owns the session and can switch
+        projects between turns without changing the URL.
       operationId: chat
       requestBody:
         required: true
@@ -224,10 +319,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChatResponse"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: LLM or embedding service unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /ingest:
     post:
+      tags: [ingest]
       summary: Ingest a document (chunk + embed)
+      description: >
+        `project_id` is passed in the request body so ingest can be called
+        without a project-scoped path, matching the same convention as /chat.
       operationId: ingest
       requestBody:
         required: true
@@ -242,9 +353,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestResponse"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: Embedding service unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /ingest/transcript:
     post:
+      tags: [ingest]
       summary: Ingest a pasted transcript (chunk + extract decisions/actions/risks)
       operationId: ingestTranscript
       requestBody:
@@ -260,9 +384,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestTranscriptResponse"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: LLM or embedding service unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /ingest/file:
     post:
+      tags: [ingest]
       summary: Upload and ingest a file
       operationId: ingestFile
       requestBody:
@@ -290,9 +427,28 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestTranscriptResponse"
+        "400":
+          description: Unsupported file type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: LLM or embedding service unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /ingest/url:
     post:
+      tags: [ingest]
       summary: Fetch and ingest content at a URL
       operationId: ingestUrl
       requestBody:
@@ -320,9 +476,28 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestTranscriptResponse"
+        "400":
+          description: URL not reachable or content not extractable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: LLM or embedding service unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/decisions:
     get:
+      tags: [studio]
       summary: List decisions extracted from transcripts
       operationId: listDecisions
       parameters:
@@ -336,9 +511,16 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Decision"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/action-items:
     get:
+      tags: [studio]
       summary: List transcript action items
       operationId: listActionItems
       parameters:
@@ -358,9 +540,16 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/ActionItem"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/risks:
     get:
+      tags: [studio]
       summary: List risks extracted from transcripts
       operationId: listRisks
       parameters:
@@ -374,9 +563,16 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Risk"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/briefing:
     get:
+      tags: [studio]
       summary: Project status snapshot with AI summary
       operationId: getBriefing
       parameters:
@@ -388,9 +584,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Briefing"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: LLM unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/standup:
     get:
+      tags: [studio]
       summary: Daily standup (Yesterday / Today / Blockers)
       operationId: getStandup
       parameters:
@@ -402,9 +611,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Standup"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: LLM unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /projects/{project_id}/sources:
     get:
+      tags: [studio]
       summary: List ingested document sources with chunk counts
       operationId: listSources
       parameters:
@@ -418,10 +640,20 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Source"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /memory/search:
     get:
+      tags: [memory]
       summary: Semantic search over conversation memory
+      description: >
+        `project_id` is a query parameter (not a path segment) because memory
+        search is a cross-cutting utility, not a sub-resource of a single project.
       operationId: memorySearch
       parameters:
         - name: project_id
@@ -452,6 +684,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/MemoryHit"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
 components:
   parameters:
@@ -462,8 +700,28 @@ components:
       schema:
         type: string
         format: uuid
+    ActionId:
+      name: action_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
 
   schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error identifier.
+          example: not_found
+        message:
+          type: string
+          description: Human-readable explanation.
+          example: Project not found
+
     Project:
       type: object
       required: [id, name, created_at]
@@ -508,6 +766,43 @@ components:
           additionalProperties: true
           nullable: true
 
+    SyncResult:
+      type: object
+      required: [synced]
+      description: Number of items synced per external ref key.
+      properties:
+        synced:
+          type: integer
+          description: Total items written to the RAG store.
+          example: 42
+        detail:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Per-ref breakdown (e.g. {"jira_project_key":42}).
+          example:
+            jira_project_key: 42
+
+    SyncStatus:
+      type: object
+      description: Last-synced timestamp per external ref key.
+      additionalProperties:
+        type: string
+        format: date-time
+        nullable: true
+      example:
+        jira_project_key: "2026-06-01T09:00:00Z"
+        github_repo: null
+
+    ActionStatus:
+      type: string
+      enum: [pending, executing, executed, rejected, failed]
+      description: >
+        Lifecycle of a human-approval action:
+        pending → executing → executed (happy path);
+        pending → rejected (human says no);
+        executing → failed (integration error).
+
     ProposeActionRequest:
       type: object
       required: [action_type, payload]
@@ -531,7 +826,7 @@ components:
         action_type:
           type: string
         status:
-          type: string
+          $ref: "#/components/schemas/ActionStatus"
         payload:
           type: object
           additionalProperties: true
@@ -655,6 +950,7 @@ components:
           nullable: true
         status:
           type: string
+          enum: [open, done]
         created_at:
           type: string
           format: date-time

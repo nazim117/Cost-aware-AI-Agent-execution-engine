@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     # Set LOG_JSON=false for plain human-readable text during interactive dev.
     log_json: bool = True
 
+    # Master switch for Prometheus metrics.  Set METRICS_ENABLED=false to
+    # suppress the /metrics endpoint (e.g. in unit tests or restricted envs).
+    metrics_enabled: bool = True
+
     # Check the repo-root .env first, then a local .env next to this file.
     # pydantic-settings reads them left-to-right; later files override earlier ones.
     # Missing files are silently skipped — env vars set in the shell always win.

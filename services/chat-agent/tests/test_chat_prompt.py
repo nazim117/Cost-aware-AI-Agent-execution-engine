@@ -200,6 +200,10 @@ async def test_draft_action_tag_replaced_with_marker():
     with (
         patch("main.embed", side_effect=_fake_embed),
         patch("main.rag.retrieve", side_effect=_fake_retrieve_empty),
+        # retrieve_by_source is called when the message contains a Jira key (e.g. "KAN-1")
+        # and that key was not already returned by rag.retrieve.  Mock it here so this
+        # unit test does not reach Qdrant.
+        patch("main.rag.retrieve_by_source", new_callable=AsyncMock, return_value=[]),
         patch("main.chat", side_effect=_spy_chat),
         patch("main.store.history", new_callable=AsyncMock, return_value=[]),
         patch("main.store.append", new_callable=AsyncMock),
@@ -241,6 +245,9 @@ async def test_malformed_draft_action_tag_stripped_silently():
     with (
         patch("main.embed", side_effect=_fake_embed),
         patch("main.rag.retrieve", side_effect=_fake_retrieve_empty),
+        # retrieve_by_source is triggered by "KAN-1" in the message when rag.retrieve
+        # returns nothing.  Mock it so this unit test does not reach Qdrant.
+        patch("main.rag.retrieve_by_source", new_callable=AsyncMock, return_value=[]),
         patch("main.chat", side_effect=_spy_chat),
         patch("main.store.history", new_callable=AsyncMock, return_value=[]),
         patch("main.store.append", new_callable=AsyncMock),

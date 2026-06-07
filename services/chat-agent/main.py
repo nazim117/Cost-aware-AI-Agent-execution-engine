@@ -44,7 +44,8 @@ from embeddings import embed
 from mcp_client import MCPClient, MCPError
 from llm import chat, validate_llm_config
 from memory import ConversationStore
-from observability import setup_telemetry
+from observability import setup_telemetry, instrument_app
+from prometheus_client import make_asgi_app as _make_metrics_app
 from projects import SCHEMA_VERSION, Project, ProjectStore
 import rag
 from request_context import set_request_id, new_request_id
@@ -150,17 +151,23 @@ async def lifespan(app: FastAPI):
     # start than to discover a missing API key on the first real user request.
     validate_llm_config()
 
-    # Bootstrap OpenTelemetry tracing + structured JSON logging.
-    # Must run after validate_llm_config() so the TracerProvider is live before
-    # the server accepts any requests.  FastAPIInstrumentor wraps 'app' here so
-    # all routes registered below automatically get a span.
-    setup_telemetry(app)
-
     yield
     # Shutdown: no explicit cleanup needed for either store.
 
 
+# Bootstrap logging + tracer provider before app creation, then instrument the
+# app before any add_middleware() calls — Starlette forbids middleware after startup.
+setup_telemetry()
+
 app = FastAPI(title="chat-agent", lifespan=lifespan)
+instrument_app(app)
+
+# Mount /metrics for Prometheus scraping.
+# make_asgi_app() returns a pure ASGI app that serves the default registry —
+# the same registry our custom counters in metrics.py write to.
+# No middleware conflict: app.mount() adds a sub-application, not middleware.
+if settings.metrics_enabled:
+    app.mount("/metrics", _make_metrics_app())
 
 # CORS — allow the Chrome extension (and any localhost origin) to call this API.
 #
@@ -207,6 +214,44 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(RequestIdMiddleware)
+
+
+import time as _time
+import metrics as _metrics_mod
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Record HTTP request count and latency into Prometheus.
+
+    Replaces prometheus-fastapi-instrumentator which conflicted with the
+    starlette version required by the Python 3.12 Docker image.
+    Uses the matched route path template (e.g. "/chat") as the handler label
+    so high-cardinality paths (e.g. "/projects/{id}") don't explode the registry.
+    """
+
+    async def dispatch(self, request: StarletteRequest, call_next) -> StarletteResponse:
+        start = _time.perf_counter()
+        response = await call_next(request)
+        duration = _time.perf_counter() - start
+
+        # Prefer the matched route template over the raw URL path to avoid
+        # high cardinality (e.g. /projects/abc and /projects/xyz → "/projects/{id}").
+        route = request.scope.get("route")
+        handler = route.path if route else request.url.path
+
+        _metrics_mod.http_requests_total.labels(
+            method=request.method,
+            handler=handler,
+            status_code=str(response.status_code),
+        ).inc()
+        _metrics_mod.http_request_duration_seconds.labels(
+            method=request.method,
+            handler=handler,
+        ).observe(duration)
+
+        return response
+
+if settings.metrics_enabled:
+    app.add_middleware(MetricsMiddleware)
 
 
 # Project CRUD models

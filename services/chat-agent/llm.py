@@ -16,6 +16,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
 from config import settings
+import metrics as _metrics
 
 
 # ─── Backend implementations ──────────────────────────────────────────────────
@@ -144,13 +145,19 @@ async def chat(messages: list[dict]) -> str:
                 )
         except HTTPException:
             span.set_status(Status(StatusCode.ERROR))
+            # Record the failed call so error rate panels in Grafana show it.
+            _metrics.record_llm_usage(p, model_label, {}, "error")
             raise
 
         # Attach token counts to the span so they appear in Jaeger.
-        # This is the foundation for later cost-per-request tracking.
-        span.set_attribute("llm.usage.prompt_tokens", usage["prompt_tokens"])
-        span.set_attribute("llm.usage.completion_tokens", usage["completion_tokens"])
-        span.set_attribute("llm.usage.total_tokens", usage["total_tokens"])
+        # Use .get() so a mock or non-standard provider returning {} doesn't crash.
+        span.set_attribute("llm.usage.prompt_tokens", usage.get("prompt_tokens", 0))
+        span.set_attribute("llm.usage.completion_tokens", usage.get("completion_tokens", 0))
+        span.set_attribute("llm.usage.total_tokens", usage.get("total_tokens", 0))
+
+        # Record token throughput and estimated cost in Prometheus.
+        # This is the "cost-aware" instrumentation the project is named after.
+        _metrics.record_llm_usage(p, model_label, usage, "ok")
 
         return reply
 

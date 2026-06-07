@@ -43,6 +43,83 @@ jobs:
           DEEPSEEK_API_KEY: dummy-key-for-ci
         run: pytest tests/ -v -m "not integration and not e2e"
 
+  integration:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/chat-agent
+
+    # Qdrant runs as a Docker service container on the same network as the job.
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.12.1
+        ports:
+          - 6333:6333
+        options: >-
+          --health-cmd "curl -f http://localhost:6333/collections || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: services/chat-agent/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Install Ollama, pull the embedding model and a small chat model.
+      # nomic-embed-text is required for all rag/embeddings tests.
+      # llama3.2:1b is the smallest available model for the LLM integration test.
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.ai/install.sh | sh
+          ollama serve &
+          sleep 5
+
+      - name: Pull Ollama models
+        run: |
+          ollama pull nomic-embed-text
+          ollama pull llama3.2:1b
+        continue-on-error: true  # don't fail the job if a model pull is slow
+
+      # Build and start the mcp-server (no vendor credentials — Jira/GitHub
+      # tools will return isError=true, which is exactly the path we test).
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: services/mcp-server/go.sum
+
+      - name: Start mcp-server
+        run: go run ./cmd/server/main.go &
+        working-directory: services/mcp-server
+        env:
+          PORT: 8083
+
+      - name: Wait for mcp-server to be ready
+        run: |
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8083/health && break || sleep 2
+          done
+
+      - name: Run integration tests
+        env:
+          QDRANT_URL: http://localhost:6333
+          OLLAMA_BASE_URL: http://localhost:11434
+          MCP_BASE_URL: http://localhost:8083
+          OTEL_ENABLED: "false"
+          METRICS_ENABLED: "false"
+          DEEPSEEK_API_KEY: dummy-key-for-ci
+          OLLAMA_CHAT_MODEL: llama3.2:1b
+        # Tests that cannot reach a service skip themselves — no hard failures
+        # from missing infrastructure.
+        run: pytest tests/ -m integration -v
+
   docker-build:
     runs-on: ubuntu-latest
     steps:

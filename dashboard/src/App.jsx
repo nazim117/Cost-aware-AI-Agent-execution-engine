@@ -11,7 +11,7 @@ function Toast({ message, url, onDismiss }) {
   }, [onDismiss]);
 
   return (
-    <div className={`toast ${url ? 'success' : ''}`}>
+    <div className={`toast ${url ? 'success' : ''}`} data-testid="toast">
       <span className="toast-msg">{message}</span>
       {url && (
         <a href={url} target="_blank" rel="noreferrer" className="toast-link">
@@ -130,6 +130,7 @@ function TopBar({ projects, activeId, onSelect, onRefresh, setToast, onEditInteg
 
       <select
         className="project-select"
+        data-testid="project-select"
         value={activeId || ''}
         onChange={handleChange}
       >
@@ -154,8 +155,9 @@ function TopBar({ projects, activeId, onSelect, onRefresh, setToast, onEditInteg
             onChange={e => setNewName(e.target.value)}
             placeholder="Project name…"
             autoFocus
+            data-testid="new-project-name"
           />
-          <button type="submit" className="btn btn-primary btn-sm" disabled={creating || !newName.trim()}>
+          <button type="submit" className="btn btn-primary btn-sm" disabled={creating || !newName.trim()} data-testid="create-project">
             Create
           </button>
           <button type="button" className="btn btn-secondary btn-sm" onClick={() => { setShowNewInput(false); setNewName(''); }}>
@@ -244,11 +246,13 @@ function DropZone({ busy, url, setUrl, onFile, onUrl }) {
           onChange={e => setUrl(e.target.value)}
           placeholder="…or paste URL"
           disabled={busy}
+          data-testid="url-input"
         />
         <button
           type="submit"
           className="btn btn-secondary btn-sm"
           disabled={busy || !url.trim()}
+          data-testid="url-add"
         >
           Add
         </button>
@@ -396,12 +400,12 @@ function LeftPane({ projectId, sourcesKey, onSourcesChange, setToast }) {
         </div>
 
         <div className="section">
-          <div className="section-title">📚 Sources ({sources.length})</div>
+          <div className="section-title" data-testid="sources-count">📚 Sources ({sources.length})</div>
           {sources.length === 0 ? (
             <p className="no-data">No sources ingested yet.</p>
           ) : (
             sources.map(s => (
-              <div key={s.source} className="source-item">
+              <div key={s.source} className="source-item" data-testid="source-item">
                 <span className="source-name" title={s.source}>{s.source}</span>
                 <span className="source-chunks">{s.chunks} chunks</span>
               </div>
@@ -466,16 +470,16 @@ function ChatPane({ projectId, onActionDrafted }) {
             <div className={`avatar ${m.role === 'user' ? 'user' : 'ai'}`}>
               {m.role === 'user' ? '👤' : '🧠'}
             </div>
-            <div className={`bubble ${m.role === 'user' ? 'user' : 'ai'}`}>
+            <div className={`bubble ${m.role === 'user' ? 'user' : 'ai'}`} data-testid={m.role === 'user' ? 'chat-message-user' : 'chat-message'}>
               <div className="prose">
                 <ReactMarkdown>{m.content}</ReactMarkdown>
               </div>
               {m.citations?.length > 0 && (
-                <details className="sources-panel">
+                <details className="sources-panel" data-testid="citations">
                   <summary className="sources-summary">Sources ({m.citations.length})</summary>
                   <ul className="sources-list">
                     {m.citations.map(c => (
-                      <li key={c.ref} className="sources-item">
+                      <li key={c.ref} className="sources-item" data-testid="citation-item">
                         [{c.ref}] {c.source} · chunk {c.chunk_index}
                       </li>
                     ))}
@@ -508,11 +512,13 @@ function ChatPane({ projectId, onActionDrafted }) {
           placeholder="Ask anything… (Enter to send, Shift+Enter for newline)"
           rows={1}
           disabled={busy}
+          data-testid="chat-input"
         />
         <button
           className={`btn send-btn ${busy || !input.trim() ? 'btn-secondary' : 'btn-primary'}`}
           onClick={send}
           disabled={busy || !input.trim()}
+          data-testid="chat-send"
         >
           {busy ? '…' : 'Send →'}
         </button>
@@ -609,6 +615,7 @@ function StudioPane({ projectId, actionsKey, setToast }) {
           <button
             key={label}
             className={`studio-tab ${tab === i ? 'active' : ''}`}
+            data-testid={i === 2 ? 'studio-tab-actions' : undefined}
             onClick={() => {
               selectTab(i);
               if (i === 0 && !briefing) loadBriefing();
@@ -755,13 +762,13 @@ function StudioPane({ projectId, actionsKey, setToast }) {
               <p className="no-actions">No pending actions.</p>
             ) : (
               actions.map(a => (
-                <div key={a.id} className="action-card">
+                <div key={a.id} className="action-card" data-testid="action-card">
                   <div className="action-type">{a.action_type}</div>
                   <div className="action-meta">{a.payload?.item_id || a.payload?.project_key || ''} · {a.payload?.ref_key}</div>
                   <div className="action-body">{a.payload?.body || a.payload?.summary || ''}{a.payload?.description ? ` — ${a.payload.description}` : ''}</div>
                   <div className="action-btns">
-                    <button className="btn-approve" onClick={() => handleApprove(a.id)}>Approve</button>
-                    <button className="btn-reject" onClick={() => handleReject(a.id)}>Reject</button>
+                    <button className="btn-approve" onClick={() => handleApprove(a.id)} data-testid="action-approve">Approve</button>
+                    <button className="btn-reject" onClick={() => handleReject(a.id)} data-testid="action-reject">Reject</button>
                   </div>
                 </div>
               ))

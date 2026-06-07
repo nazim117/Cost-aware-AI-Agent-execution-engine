@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/joho/godotenv"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -135,7 +136,11 @@ func main() {
 		span.SetAttributes(attribute.String("tool.name", params.Name))
 		defer span.End()
 
+		started := time.Now()
 		result, err := registry.Call(params.Name, params.Arguments)
+		// Record Prometheus metrics regardless of outcome.
+		// RecordToolCall captures duration and increments the calls counter.
+		observability.RecordToolCall(params.Name, err, started)
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
@@ -151,6 +156,12 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
 	})
+
+	// GET /metrics — Prometheus scrape endpoint.
+	// Exposes mcp_server_tool_calls_total, mcp_server_tool_call_duration_seconds,
+	// and standard Go runtime metrics (GC, goroutines, memory).
+	// Prometheus scrapes this from inside the Docker network at mcp-server:8083/metrics.
+	mux.Handle("/metrics", observability.Handler())
 
 	// GET /health
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

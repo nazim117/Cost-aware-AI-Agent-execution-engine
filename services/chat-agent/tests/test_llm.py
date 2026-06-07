@@ -82,7 +82,8 @@ async def test_openai_compatible_returns_content():
             s.openai_model = "openai/gpt-4o-mini"
             s.openai_provider_label = "GitHub Models"
             result = await llm_module._chat_openai_compatible(MESSAGES)
-    assert result == "hi from openai-compatible"
+    # _chat_openai_compatible returns (reply, usage) tuple.
+    assert result[0] == "hi from openai-compatible"
 
 
 @pytest.mark.asyncio
@@ -106,7 +107,8 @@ async def test_openai_compatible_502_on_non_200():
 
 @pytest.mark.asyncio
 async def test_dispatcher_routes_ollama():
-    with patch("llm._chat_ollama", new_callable=AsyncMock, return_value="ollama-reply") as mock_fn:
+    # _chat_ollama returns (reply, usage) — mock must match.
+    with patch("llm._chat_ollama", new_callable=AsyncMock, return_value=("ollama-reply", {})) as mock_fn:
         with patch("llm.settings") as s:
             s.llm_provider = "ollama"
             result = await chat(MESSAGES)
@@ -116,7 +118,8 @@ async def test_dispatcher_routes_ollama():
 
 @pytest.mark.asyncio
 async def test_dispatcher_routes_openai_compatible():
-    with patch("llm._chat_openai_compatible", new_callable=AsyncMock, return_value="cloud-reply") as mock_fn:
+    # _chat_openai_compatible returns (reply, usage) — mock must match.
+    with patch("llm._chat_openai_compatible", new_callable=AsyncMock, return_value=("cloud-reply", {})) as mock_fn:
         with patch("llm.settings") as s:
             s.llm_provider = "openai_compatible"
             result = await chat(MESSAGES)

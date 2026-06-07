@@ -299,9 +299,6 @@ async def test_execute_action_missing_ref_key_raises(stores):
         await execute_action(action, mcp=mcp, project_store=_ProjectNoRefs())
 
 
-pytestmark = pytest.mark.asyncio
-
-
 # ---------------------------------------------------------------------------
 # validate_payload
 # ---------------------------------------------------------------------------
